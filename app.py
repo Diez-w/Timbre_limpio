@@ -92,7 +92,7 @@ def recibir():
                     img2_path=ruta_rostro,
                     model_name="VGG-Face",
                     detector_backend="opencv",
-                    enforce_detection=True
+                    enforce_detection=False
                 )
                 distancia = resultado["distance"]
                 if distancia <= umbral and distancia < mejor_distancia:
