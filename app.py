@@ -67,12 +67,13 @@ def index():
 @app.route("/recibir", methods=["POST"])
 def recibir():
     if 'imagen' not in request.files:
-        return "No se envió imagen", 400
+        return "❌ No se envió imagen", 400
 
     archivo = request.files['imagen']
     nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
     ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
     archivo.save(ruta_imagen)
+    logging.info(f"📥 Imagen recibida: {nombre_archivo}")
 
     try:
         umbral = 0.30
@@ -111,7 +112,7 @@ def recibir():
                 alerta = os.path.join(ALERTA_GUIÑO_FOLDER, f"alerta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
                 cv2.imwrite(alerta, cv2.imread(ruta_imagen))
                 enviar_mensaje_whatsapp("🚨 ¡Emergencia! Se detectó un guiño.")
-            return mensaje
+            return mensaje, 200
 
         return "❌ Rostro no reconocido con precisión mínima requerida (≥90%)", 404
 
@@ -121,3 +122,4 @@ def recibir():
 
 if __name__ == "__main__":
     app.run(debug=False)
+
