@@ -10,7 +10,7 @@ import requests
 
 # Configuración de WhatsApp (CallMeBot)
 WHATSAPP_PHONE = "+51902697385"  # <-- tu número real
-CALLMEBOT_API_KEY = "2408114"  # <-- tu API key de CallMeBot
+CALLMEBOT_API_KEY = "2408114"    # <-- tu API key de CallMeBot
 
 app = Flask(__name__)
 
@@ -66,12 +66,12 @@ def index():
 
 @app.route("/recibir", methods=["POST"])
 def recibir_imagen():
-    if 'imagen' not in request.files:
-        return "No se envió ningún archivo", 400
+    if not request.data:
+        return "No se envió imagen", 400
 
-    archivo = request.files['imagen']
     ruta_imagen = os.path.join(UPLOAD_FOLDER, "foto_prueba.jpeg")
-    archivo.save(ruta_imagen)
+    with open(ruta_imagen, "wb") as f:
+        f.write(request.data)
 
     try:
         umbral = 0.30
@@ -85,7 +85,7 @@ def recibir_imagen():
                 img2_path=ruta_rostro,
                 model_name="VGG-Face",
                 detector_backend="opencv",
-                enforce_detection=True
+                enforce_detection=False
             )
 
             distancia = resultado["distance"]

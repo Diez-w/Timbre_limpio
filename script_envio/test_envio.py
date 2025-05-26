@@ -1,7 +1,7 @@
 import requests
 
 # Dirección local del servidor Flask
-url = "http://127.0.0.1:5000/recibir"
+url = "url = "https://timbre-limpio.onrender.com/recibir"
 
 # Imagen simulada tomada por la ESP32-CAM
 imagen = {'imagen': open('foto_prueba.jpeg', 'rb')}  # asegúrate de tener esta imagen
