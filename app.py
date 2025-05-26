@@ -62,7 +62,20 @@ def enviar_mensaje_whatsapp(texto):
 @app.route("/")
 def index():
     return "🟢 Servidor de reconocimiento activo"
+# ... código para recibir imagen
 
+    print("📥 Imagen recibida:", filename)
+
+    # Procesamiento DeepFace...
+    print("🔍 Procesando reconocimiento facial...")
+    
+    # Al terminar:
+    print("✅ Reconocimiento completado. Enviando WhatsApp...")
+
+    # Después de enviar WhatsApp:
+    print("📤 WhatsApp enviado.")
+
+    return "✅ WhatsApp enviado", 200
 @app.route("/recibir", methods=["POST"])
 def recibir():
     if 'imagen' not in request.files:
