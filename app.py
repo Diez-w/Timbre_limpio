@@ -121,8 +121,12 @@ def recibir():
             os.remove(ruta_imagen)
             return mensaje, 200
 
+        # Si no se reconoció el rostro con suficiente precisión
+        mensaje_no_reconocido = "❌ Rostro no reconocido con precisión mínima requerida (≥90%)"
+        logging.info(mensaje_no_reconocido)
+        enviar_mensaje_whatsapp(mensaje_no_reconocido)
         os.remove(ruta_imagen)
-        return "❌ Rostro no reconocido con precisión mínima requerida (≥90%)", 404
+        return mensaje_no_reconocido, 404
 
     except Exception as e:
         logging.error("❌ ERROR DETECTADO:", exc_info=True)
@@ -132,4 +136,3 @@ def recibir():
 
 if __name__ == "__main__":
     app.run(debug=False)
-
