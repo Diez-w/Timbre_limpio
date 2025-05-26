@@ -20,35 +20,34 @@ os.makedirs(BASE_ROSTROS_FOLDER, exist_ok=True)
 os.makedirs(ALERTA_GUIÑO_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # Máximo 2MB por imagen
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB máximo
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
 
-# --- MediaPipe setup ---
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True)
-
+# --- Función para detección de guiño ---
 def detectar_guiño(ruta_imagen):
     try:
-        imagen = cv2.imread(ruta_imagen)
-        if imagen is None:
-            return False
-        img_rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
-        resultados = face_mesh.process(img_rgb)
-        if not resultados.multi_face_landmarks:
-            return False
-        for rostro in resultados.multi_face_landmarks:
-            landmarks = rostro.landmark
-            apertura_izq = abs(landmarks[159].y - landmarks[145].y)
-            apertura_der = abs(landmarks[386].y - landmarks[374].y)
-            umbral = 0.02
-            if (apertura_izq < umbral and apertura_der >= umbral) or (apertura_der < umbral and apertura_izq >= umbral):
-                return True
+        with mp.solutions.face_mesh.FaceMesh(static_image_mode=True) as face_mesh:
+            imagen = cv2.imread(ruta_imagen)
+            if imagen is None:
+                return False
+            img_rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
+            resultados = face_mesh.process(img_rgb)
+            if not resultados.multi_face_landmarks:
+                return False
+            for rostro in resultados.multi_face_landmarks:
+                landmarks = rostro.landmark
+                apertura_izq = abs(landmarks[159].y - landmarks[145].y)
+                apertura_der = abs(landmarks[386].y - landmarks[374].y)
+                umbral = 0.02
+                if (apertura_izq < umbral and apertura_der >= umbral) or (apertura_der < umbral and apertura_izq >= umbral):
+                    return True
     except Exception as e:
         logging.warning(f"Fallo en detectar_guiño: {e}")
     return False
 
+# --- Enviar mensaje por WhatsApp ---
 def enviar_mensaje_whatsapp(texto):
     try:
         url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={requests.utils.quote(texto)}&apikey={CALLMEBOT_API_KEY}"
@@ -62,7 +61,7 @@ def enviar_mensaje_whatsapp(texto):
 
 @app.route("/")
 def index():
-    return "Servidor de reconocimiento activo"
+    return "🟢 Servidor de reconocimiento activo"
 
 @app.route("/recibir", methods=["POST"])
 def recibir():
@@ -70,6 +69,9 @@ def recibir():
         return "❌ No se envió imagen", 400
 
     archivo = request.files['imagen']
+    if not archivo.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+        return "❌ Formato de archivo no soportado", 400
+
     nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
     ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
     archivo.save(ruta_imagen)
@@ -82,6 +84,7 @@ def recibir():
 
         rostros = os.listdir(BASE_ROSTROS_FOLDER)
         if not rostros:
+            os.remove(ruta_imagen)
             return "⚠️ No hay imágenes en la base de rostros", 500
 
         for rostro in rostros:
@@ -110,14 +113,21 @@ def recibir():
 
             if detectar_guiño(ruta_imagen):
                 alerta = os.path.join(ALERTA_GUIÑO_FOLDER, f"alerta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
-                cv2.imwrite(alerta, cv2.imread(ruta_imagen))
+                imagen_cv = cv2.imread(ruta_imagen)
+                if imagen_cv is not None:
+                    cv2.imwrite(alerta, imagen_cv)
                 enviar_mensaje_whatsapp("🚨 ¡Emergencia! Se detectó un guiño.")
+
+            os.remove(ruta_imagen)
             return mensaje, 200
 
+        os.remove(ruta_imagen)
         return "❌ Rostro no reconocido con precisión mínima requerida (≥90%)", 404
 
     except Exception as e:
         logging.error("❌ ERROR DETECTADO:", exc_info=True)
+        if os.path.exists(ruta_imagen):
+            os.remove(ruta_imagen)
         return f"❌ Error al procesar imagen: {str(e)}", 500
 
 if __name__ == "__main__":
