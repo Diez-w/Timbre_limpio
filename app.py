@@ -1,10 +1,14 @@
 import os
 from flask import Flask, request
-from datetime import datetime
+from deepface import DeepFace
 import cv2
 import mediapipe as mp
-from deepface import DeepFace
+from datetime import datetime
 import requests
+
+# Configuración de WhatsApp (CallMeBot)
+WHATSAPP_PHONE = "+51902697385"
+CALLMEBOT_API_KEY = "2408114"
 
 app = Flask(__name__)
 
@@ -16,23 +20,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(BASE_ROSTROS_FOLDER, exist_ok=True)
 os.makedirs(ALERTA_GUIÑO_FOLDER, exist_ok=True)
 
-# Inicializar MediaPipe
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True)
-
-WHATSAPP_PHONE = "+51902697385"
-CALLMEBOT_API_KEY = "2408114"
-
-def enviar_mensaje_whatsapp(texto):
-    try:
-        url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={requests.utils.quote(texto)}&apikey={CALLMEBOT_API_KEY}"
-        response = requests.get(url)
-        if response.status_code in [200, 201]:
-            print("✅ Mensaje enviado por WhatsApp")
-        else:
-            print(f"❌ Error al enviar mensaje: {response.status_code}")
-    except Exception as e:
-        print("❌ Excepción al enviar WhatsApp:", e)
 
 def detectar_guiño(ruta_imagen):
     imagen = cv2.imread(ruta_imagen)
@@ -54,53 +43,62 @@ def detectar_guiño(ruta_imagen):
             continue
     return False
 
+def enviar_mensaje_whatsapp(texto):
+    try:
+        url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={requests.utils.quote(texto)}&apikey={CALLMEBOT_API_KEY}"
+        response = requests.get(url)
+        if response.status_code not in [200, 201]:
+            print(f"❌ Error al enviar WhatsApp: {response.status_code}")
+        else:
+            print("✅ WhatsApp enviado")
+    except Exception as e:
+        print(f"❌ Excepción al enviar WhatsApp: {e}")
+
 @app.route("/")
 def index():
-    return "Servidor de reconocimiento activo."
+    return "Servidor de reconocimiento activo"
 
 @app.route("/recibir", methods=["POST"])
-def recibir_imagen():
-    if 'file' not in request.files:
+def recibir():
+    if 'imagen' not in request.files:
         return "No se envió imagen", 400
 
-    archivo = request.files['file']
-    ruta_imagen = os.path.join(UPLOAD_FOLDER, "foto_recibida.jpg")
+    archivo = request.files['imagen']
+    nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
     archivo.save(ruta_imagen)
 
     try:
+        umbral = 0.30
         mejor_match = None
         mejor_distancia = float("inf")
-        umbral = 0.30
 
-        for nombre_archivo in os.listdir(BASE_ROSTROS_FOLDER):
-            ruta_rostro = os.path.join(BASE_ROSTROS_FOLDER, nombre_archivo)
+        for rostro in os.listdir(BASE_ROSTROS_FOLDER):
             resultado = DeepFace.verify(
                 img1_path=ruta_imagen,
-                img2_path=ruta_rostro,
+                img2_path=os.path.join(BASE_ROSTROS_FOLDER, rostro),
                 model_name="VGG-Face",
                 detector_backend="opencv",
                 enforce_detection=True
             )
             distancia = resultado["distance"]
             if distancia <= umbral and distancia < mejor_distancia:
-                mejor_match = nombre_archivo
+                mejor_match = rostro
                 mejor_distancia = distancia
 
         if mejor_match:
             precision = 90 + ((umbral - mejor_distancia) / umbral) * 10
-            mensaje = f"🔔 {mejor_match} reconocido con {precision:.2f}% de precisión."
+            mensaje = f"🔔 {mejor_match} reconocido con {precision:.2f}% precisión."
             enviar_mensaje_whatsapp(mensaje)
 
             if detectar_guiño(ruta_imagen):
-                alerta = f"🚨 ¡Guiño detectado en {mejor_match}!"
-                enviar_mensaje_whatsapp(alerta)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                ruta_alerta = os.path.join(ALERTA_GUIÑO_FOLDER, f"alerta_{timestamp}.jpg")
-                cv2.imwrite(ruta_alerta, cv2.imread(ruta_imagen))
+                alerta = os.path.join(ALERTA_GUIÑO_FOLDER, f"alerta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                cv2.imwrite(alerta, cv2.imread(ruta_imagen))
+                enviar_mensaje_whatsapp("🚨 ¡Emergencia! Se detectó un guiño.")
 
-            return f"{mejor_match} reconocido con {precision:.2f}% de precisión", 200
+            return mensaje
         else:
-            return "❌ Rostro no reconocido con suficiente precisión", 404
+            return "❌ Rostro no reconocido con precisión mínima requerida (≥90%)", 404
 
     except Exception as e:
         print("❌ ERROR DETECTADO:", e)
