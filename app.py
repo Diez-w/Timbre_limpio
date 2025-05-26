@@ -6,6 +6,7 @@ import mediapipe as mp
 from datetime import datetime
 import requests
 import logging
+import threading
 
 # --- Configuración ---
 WHATSAPP_PHONE = "+51902697385"
@@ -59,37 +60,8 @@ def enviar_mensaje_whatsapp(texto):
     except Exception as e:
         logging.error(f"❌ Excepción al enviar WhatsApp: {e}")
 
-@app.route("/")
-def index():
-    return "🟢 Servidor de reconocimiento activo"
-# ... código para recibir imagen
-
-    print("📥 Imagen recibida:", filename)
-
-    # Procesamiento DeepFace...
-    print("🔍 Procesando reconocimiento facial...")
-    
-    # Al terminar:
-    print("✅ Reconocimiento completado. Enviando WhatsApp...")
-
-    # Después de enviar WhatsApp:
-    print("📤 WhatsApp enviado.")
-
-    return "✅ WhatsApp enviado", 200
-@app.route("/recibir", methods=["POST"])
-def recibir():
-    if 'imagen' not in request.files:
-        return "❌ No se envió imagen", 400
-
-    archivo = request.files['imagen']
-    if not archivo.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-        return "❌ Formato de archivo no soportado", 400
-
-    nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-    ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
-    archivo.save(ruta_imagen)
-    logging.info(f"📥 Imagen recibida: {nombre_archivo}")
-
+# --- Función pesada que corre en hilo aparte ---
+def proceso_largo(ruta_imagen):
     try:
         umbral = 0.30
         mejor_match = None
@@ -97,8 +69,10 @@ def recibir():
 
         rostros = os.listdir(BASE_ROSTROS_FOLDER)
         if not rostros:
-            os.remove(ruta_imagen)
-            return "⚠️ No hay imágenes en la base de rostros", 500
+            logging.error("⚠️ No hay imágenes en la base de rostros")
+            if os.path.exists(ruta_imagen):
+                os.remove(ruta_imagen)
+            return
 
         for rostro in rostros:
             ruta_rostro = os.path.join(BASE_ROSTROS_FOLDER, rostro)
@@ -131,21 +105,37 @@ def recibir():
                     cv2.imwrite(alerta, imagen_cv)
                 enviar_mensaje_whatsapp("🚨 ¡Emergencia! Se detectó un guiño.")
 
-            os.remove(ruta_imagen)
-            return mensaje, 200
-
-        # Si no se reconoció el rostro con suficiente precisión
-        mensaje_no_reconocido = "❌ Rostro no reconocido con precisión mínima requerida (≥90%)"
-        logging.info(mensaje_no_reconocido)
-        enviar_mensaje_whatsapp(mensaje_no_reconocido)
-        os.remove(ruta_imagen)
-        return mensaje_no_reconocido, 404
+        else:
+            logging.info("❌ Rostro no reconocido con precisión mínima requerida (≥90%)")
 
     except Exception as e:
-        logging.error("❌ ERROR DETECTADO:", exc_info=True)
+        logging.error(f"❌ Error en proceso_largo: {e}", exc_info=True)
+    finally:
         if os.path.exists(ruta_imagen):
             os.remove(ruta_imagen)
-        return f"❌ Error al procesar imagen: {str(e)}", 500
+
+@app.route("/")
+def index():
+    return "🟢 Servidor de reconocimiento activo"
+
+@app.route("/recibir", methods=["POST"])
+def recibir():
+    if 'imagen' not in request.files:
+        return "❌ No se envió imagen", 400
+
+    archivo = request.files['imagen']
+    if not archivo.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+        return "❌ Formato de archivo no soportado", 400
+
+    nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
+    archivo.save(ruta_imagen)
+    logging.info(f"📥 Imagen recibida: {nombre_archivo}")
+
+    # Ejecutar el procesamiento pesado en un thread aparte
+    threading.Thread(target=proceso_largo, args=(ruta_imagen,), daemon=True).start()
+
+    return "✅ Imagen recibida, procesamiento en curso", 200
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(debug=False, host="0.0.0.0", port=10000)
