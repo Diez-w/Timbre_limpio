@@ -60,12 +60,15 @@ def enviar_mensaje_whatsapp(texto):
     except Exception as e:
         logging.error(f"❌ Excepción al enviar WhatsApp: {e}")
 
-# --- Función pesada que corre en hilo aparte ---
+# --- Función pesada que corre en hilo aparte (CORREGIDA) ---
 def proceso_largo(ruta_imagen):
     try:
         umbral = 0.30
         mejor_match = None
         mejor_distancia = float("inf")
+
+        if not os.path.exists(ruta_imagen):
+            return
 
         rostros = os.listdir(BASE_ROSTROS_FOLDER)
         if not rostros:
@@ -74,6 +77,7 @@ def proceso_largo(ruta_imagen):
                 os.remove(ruta_imagen)
             return
 
+        # Iterar de manera segura por cada rostro de la base de datos
         for rostro in rostros:
             ruta_rostro = os.path.join(BASE_ROSTROS_FOLDER, rostro)
             try:
@@ -89,7 +93,8 @@ def proceso_largo(ruta_imagen):
                     mejor_match = rostro
                     mejor_distancia = distancia
             except Exception as e:
-                logging.warning(f"No se pudo comparar con {rostro}: {e}")
+                # Captura el error de OpenCV/archivos corruptos sin romper el bucle completo
+                logging.warning(f"❌ Saltando rostro problemático o corrupto ({rostro}): {e}")
                 continue
 
         if mejor_match:
@@ -98,21 +103,28 @@ def proceso_largo(ruta_imagen):
             logging.info(mensaje)
             enviar_mensaje_whatsapp(mensaje)
 
-            if detectar_guiño(ruta_imagen):
-                alerta = os.path.join(ALERTA_GUIÑO_FOLDER, f"alerta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
-                imagen_cv = cv2.imread(ruta_imagen)
-                if imagen_cv is not None:
-                    cv2.imwrite(alerta, imagen_cv)
-                enviar_mensaje_whatsapp("🚨 ¡Emergencia! Se detectó un guiño.")
+            # Procesar el guiño de manera aislada y protegida
+            try:
+                if detectar_guiño(ruta_imagen):
+                    alerta = os.path.join(ALERTA_GUIÑO_FOLDER, f"alerta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                    imagen_cv = cv2.imread(ruta_imagen)
+                    if imagen_cv is not None:
+                        cv2.imwrite(alerta, imagen_cv)
+                    enviar_mensaje_whatsapp("🚨 ¡Emergencia! Se detectó un guiño.")
+            except Exception as eGuiño:
+                logging.error(f"❌ Fallo interno al evaluar guiño: {eGuiño}")
 
         else:
             logging.info("❌ Rostro no reconocido con precisión mínima requerida (≥90%)")
 
     except Exception as e:
-        logging.error(f"❌ Error en proceso_largo: {e}", exc_info=True)
+        logging.error(f"❌ Error crítico en proceso_largo: {e}", exc_info=True)
     finally:
         if os.path.exists(ruta_imagen):
-            os.remove(ruta_imagen)
+            try:
+                os.remove(ruta_imagen)
+            except Exception as eDelete:
+                logging.warning(f"No se pudo eliminar el archivo temporal: {eDelete}")
 
 @app.route("/")
 def index():
