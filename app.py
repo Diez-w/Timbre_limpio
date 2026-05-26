@@ -60,7 +60,7 @@ def enviar_mensaje_whatsapp(texto):
     except Exception as e:
         logging.error(f"❌ Excepción al enviar WhatsApp: {e}")
 
-# --- Función pesada que corre en hilo aparte (CORREGIDA) ---
+# --- Función pesada que corre en hilo aparte ---
 def proceso_largo(ruta_imagen):
     try:
         umbral = 0.30
@@ -77,7 +77,6 @@ def proceso_largo(ruta_imagen):
                 os.remove(ruta_imagen)
             return
 
-        # Iterar de manera segura por cada rostro de la base de datos
         for rostro in rostros:
             ruta_rostro = os.path.join(BASE_ROSTROS_FOLDER, rostro)
             try:
@@ -93,8 +92,7 @@ def proceso_largo(ruta_imagen):
                     mejor_match = rostro
                     mejor_distancia = distancia
             except Exception as e:
-                # Captura el error de OpenCV/archivos corruptos sin romper el bucle completo
-                logging.warning(f"❌ Saltando rostro problemático o corrupto ({rostro}): {e}")
+                logging.warning(f"❌ Saltando rostro problemático ({rostro}): {e}")
                 continue
 
         if mejor_match:
@@ -103,7 +101,6 @@ def proceso_largo(ruta_imagen):
             logging.info(mensaje)
             enviar_mensaje_whatsapp(mensaje)
 
-            # Procesar el guiño de manera aislada y protegida
             try:
                 if detectar_guiño(ruta_imagen):
                     alerta = os.path.join(ALERTA_GUIÑO_FOLDER, f"alerta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
@@ -112,7 +109,7 @@ def proceso_largo(ruta_imagen):
                         cv2.imwrite(alerta, imagen_cv)
                     enviar_mensaje_whatsapp("🚨 ¡Emergencia! Se detectó un guiño.")
             except Exception as eGuiño:
-                logging.error(f"❌ Fallo interno al evaluar guiño: {eGuiño}")
+                logging.error(f"❌ Fallo al evaluar guiño: {eGuiño}")
 
         else:
             logging.info("❌ Rostro no reconocido con precisión mínima requerida (≥90%)")
@@ -132,17 +129,32 @@ def index():
 
 @app.route("/recibir", methods=["POST"])
 def recibir():
-    if 'imagen' not in request.files:
-        return "❌ No se envió imagen", 400
-
-    archivo = request.files['imagen']
-    if not archivo.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-        return "❌ Formato de archivo no soportado", 400
-
-    nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-    ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
-    archivo.save(ruta_imagen)
-    logging.info(f"📥 Imagen recibida: {nombre_archivo}")
+    # Verificar si la imagen viene como binario directo (ESP32)
+    if request.headers.get('Content-Type') == 'image/jpeg':
+        raw_data = request.get_data()
+        if not raw_data:
+            return "❌ No se recibió imagen", 400
+        
+        nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
+        
+        with open(ruta_imagen, 'wb') as f:
+            f.write(raw_data)
+        logging.info(f"📥 Imagen recibida (binario): {nombre_archivo}")
+    
+    # Verificar si la imagen viene como multipart/form-data
+    elif 'imagen' in request.files:
+        archivo = request.files['imagen']
+        if not archivo.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            return "❌ Formato de archivo no soportado", 400
+        
+        nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
+        archivo.save(ruta_imagen)
+        logging.info(f"📥 Imagen recibida (multipart): {nombre_archivo}")
+    
+    else:
+        return "❌ No se envió imagen en formato válido", 400
 
     # Ejecutar el procesamiento pesado en un thread aparte
     threading.Thread(target=proceso_largo, args=(ruta_imagen,), daemon=True).start()
