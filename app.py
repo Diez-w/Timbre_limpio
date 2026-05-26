@@ -5,8 +5,8 @@ from flask import Flask, request, jsonify
 import mediapipe as mp
 from datetime import datetime
 import logging
-import pickle
 from sklearn.metrics.pairwise import cosine_similarity
+import pickle
 
 # --- Configuración ---
 UPLOAD_FOLDER = "static/uploads"
@@ -28,7 +28,7 @@ face_detector = mp_face_detection.FaceDetection(min_detection_confidence=0.5)
 known_faces = {}  # {nombre: embedding}
 
 def extract_face_embedding(img):
-    """Extrae embedding facial usando MediaPipe Face Mesh"""
+    """Extrae embedding facial usando MediaPipe Face Mesh (468 landmarks)"""
     with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as face_mesh:
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = face_mesh.process(rgb)
@@ -44,6 +44,9 @@ def load_known_faces():
     global known_faces
     known_faces = {}
     
+    if not os.path.exists(BASE_ROSTROS_FOLDER):
+        return
+    
     for filename in os.listdir(BASE_ROSTROS_FOLDER):
         if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
             img_path = os.path.join(BASE_ROSTROS_FOLDER, filename)
@@ -57,8 +60,23 @@ def load_known_faces():
     
     logging.info(f"✅ Cargados {len(known_faces)} rostros conocidos")
 
-# Cargar rostros al iniciar
-load_known_faces()
+def reconocer_rostro(embedding, threshold=0.4):
+    """Compara embedding con rostros conocidos usando similitud de coseno"""
+    if embedding is None or len(known_faces) == 0:
+        return None, 0
+    
+    mejor_nombre = None
+    mejor_similitud = 0
+    
+    for nombre, known_embedding in known_faces.items():
+        similitud = cosine_similarity([embedding], [known_embedding])[0][0]
+        if similitud > mejor_similitud:
+            mejor_similitud = similitud
+            mejor_nombre = nombre
+    
+    if mejor_similitud >= threshold:
+        return mejor_nombre, mejor_similitud
+    return None, 0
 
 def detectar_guiño(imagen):
     """Detecta guiño usando MediaPipe Face Mesh"""
@@ -80,7 +98,7 @@ def detectar_guiño(imagen):
             left_ear = abs(left_eye_top - left_eye_bottom)
             right_ear = abs(right_eye_top - right_eye_bottom)
             
-            umbral = 0.015  # Umbral ajustado para detección rápida
+            umbral = 0.015  # Umbral para detección rápida
             
             # Guiño: un ojo cerrado y el otro abierto
             if (left_ear < umbral and right_ear > umbral * 2) or \
@@ -90,27 +108,12 @@ def detectar_guiño(imagen):
         logging.warning(f"Error detectar guiño: {e}")
     return False
 
-def reconocer_rostro(embedding, threshold=0.4):
-    """Compara embedding con rostros conocidos usando similitud de coseno"""
-    if embedding is None or len(known_faces) == 0:
-        return None, 0
-    
-    mejor_nombre = None
-    mejor_similitud = 0
-    
-    for nombre, known_embedding in known_faces.items():
-        similitud = cosine_similarity([embedding], [known_embedding])[0][0]
-        if similitud > mejor_similitud:
-            mejor_similitud = similitud
-            mejor_nombre = nombre
-    
-    if mejor_similitud >= threshold:
-        return mejor_nombre, mejor_similitud
-    return None, 0
+# Cargar rostros al iniciar
+load_known_faces()
 
 @app.route("/")
 def index():
-    return jsonify({"status": "online"})
+    return jsonify({"status": "online", "service": "Reconocimiento facial", "rostros_cargados": len(known_faces)})
 
 @app.route("/recibir", methods=["POST"])
 def recibir():
@@ -151,7 +154,7 @@ def recibir():
             "nombre": None,
             "guino": False,
             "activar_rele": False,
-            "mensaje": "No se pudieron extraer landmarks"
+            "mensaje": "No se pudieron extraer landmarks faciales"
         }), 200
     
     # Reconocer rostro
@@ -190,8 +193,6 @@ def recibir():
         }), 200
 
 if __name__ == "__main__":
-    import os
-    # Toma el puerto de la variable de entorno PORT, o usa el 10000 por defecto.
+    logging.basicConfig(level=logging.INFO)
     port = int(os.environ.get("PORT", 10000))
-    # Es MUY importante que el host sea '0.0.0.0'
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=False, host="0.0.0.0", port=port)
