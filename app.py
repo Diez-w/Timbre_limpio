@@ -190,5 +190,8 @@ def recibir():
         }), 200
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    app.run(debug=False, host="0.0.0.0", port=10000)
+    import os
+    # Toma el puerto de la variable de entorno PORT, o usa el 10000 por defecto.
+    port = int(os.environ.get("PORT", 10000))
+    # Es MUY importante que el host sea '0.0.0.0'
+    app.run(host="0.0.0.0", port=port)
