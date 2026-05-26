@@ -1,5 +1,6 @@
 import os
-from flask import Flask, request
+import json
+from flask import Flask, request, jsonify
 from deepface import DeepFace
 import cv2
 import mediapipe as mp
@@ -60,72 +61,97 @@ def enviar_mensaje_whatsapp(texto):
     except Exception as e:
         logging.error(f"❌ Excepción al enviar WhatsApp: {e}")
 
-# --- Función pesada que corre en hilo aparte ---
-def proceso_largo(ruta_imagen):
+# --- Función de procesamiento (devuelve resultado) ---
+def procesar_imagen(ruta_imagen):
+    resultado = {
+        "reconocido": False,
+        "nombre": None,
+        "guiño": False,
+        "activar_rele": False,
+        "mensaje": ""
+    }
+    
     try:
         umbral = 0.30
         mejor_match = None
         mejor_distancia = float("inf")
 
         if not os.path.exists(ruta_imagen):
-            return
+            resultado["mensaje"] = "Error: archivo no existe"
+            return resultado
 
         rostros = os.listdir(BASE_ROSTROS_FOLDER)
         if not rostros:
-            logging.error("⚠️ No hay imágenes en la base de rostros")
-            if os.path.exists(ruta_imagen):
-                os.remove(ruta_imagen)
-            return
+            resultado["mensaje"] = "No hay rostros en la base de datos"
+            return resultado
 
         for rostro in rostros:
             ruta_rostro = os.path.join(BASE_ROSTROS_FOLDER, rostro)
             try:
-                resultado = DeepFace.verify(
+                resultado_verify = DeepFace.verify(
                     img1_path=ruta_imagen,
                     img2_path=ruta_rostro,
                     model_name="VGG-Face",
                     detector_backend="opencv",
                     enforce_detection=False
                 )
-                distancia = resultado["distance"]
+                distancia = resultado_verify["distance"]
                 if distancia <= umbral and distancia < mejor_distancia:
                     mejor_match = rostro
                     mejor_distancia = distancia
             except Exception as e:
-                logging.warning(f"❌ Saltando rostro problemático ({rostro}): {e}")
+                logging.warning(f"Saltando rostro ({rostro}): {e}")
                 continue
 
         if mejor_match:
+            resultado["reconocido"] = True
+            resultado["nombre"] = mejor_match.replace('.jpg', '').replace('.png', '').replace('.jpeg', '')
             precision = 90 + ((umbral - mejor_distancia) / umbral) * 10
-            mensaje = f"🔔 {mejor_match} reconocido con {precision:.2f}% precisión."
-            logging.info(mensaje)
-            enviar_mensaje_whatsapp(mensaje)
-
+            resultado["mensaje"] = f"Rostro reconocido: {resultado['nombre']} con {precision:.2f}% precisión"
+            logging.info(resultado["mensaje"])
+            enviar_mensaje_whatsapp(f"🔔 {resultado['nombre']} reconocido con {precision:.2f}% precisión.")
+            
+            # Detectar guiño
             try:
                 if detectar_guiño(ruta_imagen):
+                    resultado["guiño"] = True
+                    resultado["mensaje"] = f"Rostro reconocido: {resultado['nombre']}. GUIÑO detectado - EMERGENCIA"
+                    resultado["activar_rele"] = False
+                    logging.info(resultado["mensaje"])
+                    enviar_mensaje_whatsapp(f"🚨 ¡EMERGENCIA! {resultado['nombre']} ha realizado un GUIÑO.")
+                    # Guardar alerta
                     alerta = os.path.join(ALERTA_GUIÑO_FOLDER, f"alerta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
                     imagen_cv = cv2.imread(ruta_imagen)
                     if imagen_cv is not None:
                         cv2.imwrite(alerta, imagen_cv)
-                    enviar_mensaje_whatsapp("🚨 ¡Emergencia! Se detectó un guiño.")
-            except Exception as eGuiño:
-                logging.error(f"❌ Fallo al evaluar guiño: {eGuiño}")
-
+                else:
+                    resultado["guiño"] = False
+                    resultado["mensaje"] = f"Rostro reconocido: {resultado['nombre']}. Sin guiño"
+                    resultado["activar_rele"] = True
+                    logging.info(resultado["mensaje"])
+                    enviar_mensaje_whatsapp(f"✅ Acceso permitido: {resultado['nombre']} (sin guiño).")
+            except Exception as e:
+                logging.error(f"Error en detección de guiño: {e}")
+                resultado["guiño"] = False
+                resultado["activar_rele"] = True
         else:
-            logging.info("❌ Rostro no reconocido con precisión mínima requerida (≥90%)")
+            resultado["reconocido"] = False
+            resultado["nombre"] = None
+            resultado["guiño"] = False
+            resultado["activar_rele"] = False
+            resultado["mensaje"] = "Rostro NO reconocido"
+            logging.info("❌ Rostro no reconocido")
+            enviar_mensaje_whatsapp("❌ Acceso DENEGADO: Rostro no reconocido.")
 
     except Exception as e:
-        logging.error(f"❌ Error crítico en proceso_largo: {e}", exc_info=True)
-    finally:
-        if os.path.exists(ruta_imagen):
-            try:
-                os.remove(ruta_imagen)
-            except Exception as eDelete:
-                logging.warning(f"No se pudo eliminar el archivo temporal: {eDelete}")
+        logging.error(f"Error crítico en procesamiento: {e}")
+        resultado["mensaje"] = f"Error: {str(e)}"
+    
+    return resultado
 
 @app.route("/")
 def index():
-    return "🟢 Servidor de reconocimiento activo"
+    return jsonify({"status": "online", "service": "Reconocimiento facial"})
 
 @app.route("/recibir", methods=["POST"])
 def recibir():
@@ -133,7 +159,7 @@ def recibir():
     if request.headers.get('Content-Type') == 'image/jpeg':
         raw_data = request.get_data()
         if not raw_data:
-            return "❌ No se recibió imagen", 400
+            return jsonify({"error": "No se recibió imagen"}), 400
         
         nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
@@ -142,11 +168,10 @@ def recibir():
             f.write(raw_data)
         logging.info(f"📥 Imagen recibida (binario): {nombre_archivo}")
     
-    # Verificar si la imagen viene como multipart/form-data
     elif 'imagen' in request.files:
         archivo = request.files['imagen']
         if not archivo.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-            return "❌ Formato de archivo no soportado", 400
+            return jsonify({"error": "Formato no soportado"}), 400
         
         nombre_archivo = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         ruta_imagen = os.path.join(UPLOAD_FOLDER, nombre_archivo)
@@ -154,12 +179,26 @@ def recibir():
         logging.info(f"📥 Imagen recibida (multipart): {nombre_archivo}")
     
     else:
-        return "❌ No se envió imagen en formato válido", 400
+        return jsonify({"error": "Formato no válido"}), 400
 
-    # Ejecutar el procesamiento pesado en un thread aparte
-    threading.Thread(target=proceso_largo, args=(ruta_imagen,), daemon=True).start()
+    # Procesar la imagen y obtener resultado
+    resultado = procesar_imagen(ruta_imagen)
+    
+    # Eliminar archivo temporal
+    try:
+        if os.path.exists(ruta_imagen):
+            os.remove(ruta_imagen)
+    except Exception as e:
+        logging.warning(f"No se pudo eliminar: {e}")
 
-    return "✅ Imagen recibida, procesamiento en curso", 200
+    # Devolver respuesta JSON para el ESP32
+    return jsonify({
+        "reconocido": resultado["reconocido"],
+        "nombre": resultado["nombre"],
+        "guino": resultado["guiño"],
+        "activar_rele": resultado["activar_rele"],
+        "mensaje": resultado["mensaje"]
+    }), 200
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=10000)
