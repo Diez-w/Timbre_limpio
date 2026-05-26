@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 # Inicializar FER para detección de emociones (guiños)
 emotion_detector = FER(mtcnn=False)
 
-# Estructura para rostros conocidos (usando histogramas de color)
+# Estructura para rostros conocidos
 known_faces_data = {}
 
 def extract_face(img):
@@ -85,13 +85,11 @@ def recognize_face(img, threshold=0.3):
     mejor_distancia = float('inf')
     
     for nombre, known_vector in known_faces_data.items():
-        # Distancia euclidiana entre vectores de 2500 elementos (50x50)
         distancia = np.linalg.norm(query_vector - known_vector)
         if distancia < mejor_distancia:
             mejor_distancia = distancia
             mejor_nombre = nombre
     
-    # Convertir distancia a confianza (heurística)
     confianza = max(0, min(100, 100 - (mejor_distancia / 30)))
     
     if confianza >= threshold * 100:
@@ -101,7 +99,6 @@ def recognize_face(img, threshold=0.3):
 def detectar_guino(img):
     """Detecta guiño usando FER (happy/surprise)"""
     try:
-        # FER espera RGB
         rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         emociones = emotion_detector.detect_emotions(rgb_img)
         
@@ -110,7 +107,6 @@ def detectar_guino(img):
             happy = emocion_data.get('happy', 0)
             surprise = emocion_data.get('surprise', 0)
             
-            # Si felicidad o sorpresa superan 0.6, puede ser un guiño
             if happy > 0.6 or surprise > 0.6:
                 return True
     except Exception as e:
@@ -131,7 +127,6 @@ def recibir():
     start_time = datetime.now()
     
     try:
-        # Recibir JSON con foto en base64
         data = request.get_json()
         if not data or 'foto' not in data:
             return jsonify({"error": "No se recibió foto", "activar_rele": False}), 400
@@ -146,11 +141,9 @@ def recibir():
         
         logging.info(f"📥 Foto recibida ({len(img_data)} bytes)")
         
-        # Reconocimiento facial
         nombre, confianza = recognize_face(img)
         
         if nombre:
-            # Detectar guiño
             tiene_guino = detectar_guino(img)
             tiempo = (datetime.now() - start_time).total_seconds()
             
@@ -164,7 +157,7 @@ def recibir():
                     "tiempo": round(tiempo, 2)
                 }), 200
             else:
-                logging.info(f"✅ {nombre} - reconocido (confianza {confianza}%) - {tiempo:.2f}s")
+                logging.info(f"✅ {nombre} - reconocido ({confianza}%) - {tiempo:.2f}s")
                 return jsonify({
                     "activar_rele": True,
                     "motivo": "reconocido",
@@ -187,7 +180,6 @@ def recibir():
         logging.error(f"Error: {e}")
         return jsonify({"error": str(e), "activar_rele": False}), 500
 
-# Cargar rostros al iniciar
 load_known_faces()
 
 if __name__ == "__main__":
