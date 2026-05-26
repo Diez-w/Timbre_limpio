@@ -1,6 +1,5 @@
 Flask==2.2.5
 gunicorn==20.1.0
-edgeface-knn==0.1.0
-fer==2.0.0
 opencv-python-headless==4.8.0.76
 numpy==1.23.5
+fer==2.0.0
