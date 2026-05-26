@@ -30,7 +30,8 @@ logging.basicConfig(level=logging.INFO)
 # --- Función para detección de guiño ---
 def detectar_guiño(ruta_imagen):
     try:
-        with mp.solutions.face_mesh.FaceMesh(static_image_mode=True) as face_mesh:
+        mp_face_mesh = mp.solutions.face_mesh
+        with mp_face_mesh.FaceMesh(static_image_mode=True) as face_mesh:
             imagen = cv2.imread(ruta_imagen)
             if imagen is None:
                 return False
@@ -40,10 +41,20 @@ def detectar_guiño(ruta_imagen):
                 return False
             for rostro in resultados.multi_face_landmarks:
                 landmarks = rostro.landmark
-                apertura_izq = abs(landmarks[159].y - landmarks[145].y)
-                apertura_der = abs(landmarks[386].y - landmarks[374].y)
-                umbral = 0.02
-                if (apertura_izq < umbral and apertura_der >= umbral) or (apertura_der < umbral and apertura_izq >= umbral):
+                # Obtener puntos de referencia para ojos
+                ojo_izq_superior = landmarks[159].y
+                ojo_izq_inferior = landmarks[145].y
+                ojo_der_superior = landmarks[386].y
+                ojo_der_inferior = landmarks[374].y
+                
+                apertura_izq = abs(ojo_izq_superior - ojo_izq_inferior)
+                apertura_der = abs(ojo_der_superior - ojo_der_inferior)
+                
+                umbral = 0.02  # Umbral para considerar ojo cerrado
+                
+                # Detectar si un ojo está cerrado y el otro abierto
+                if (apertura_izq < umbral and apertura_der >= umbral) or \
+                   (apertura_der < umbral and apertura_izq >= umbral):
                     return True
     except Exception as e:
         logging.warning(f"Fallo en detectar_guiño: {e}")
@@ -66,7 +77,7 @@ def procesar_imagen(ruta_imagen):
     resultado = {
         "reconocido": False,
         "nombre": None,
-        "guiño": False,
+        "guino": False,
         "activar_rele": False,
         "mensaje": ""
     }
@@ -109,12 +120,14 @@ def procesar_imagen(ruta_imagen):
             precision = 90 + ((umbral - mejor_distancia) / umbral) * 10
             resultado["mensaje"] = f"Rostro reconocido: {resultado['nombre']} con {precision:.2f}% precisión"
             logging.info(resultado["mensaje"])
+            
+            # Enviar WhatsApp de reconocimiento
             enviar_mensaje_whatsapp(f"🔔 {resultado['nombre']} reconocido con {precision:.2f}% precisión.")
             
             # Detectar guiño
             try:
                 if detectar_guiño(ruta_imagen):
-                    resultado["guiño"] = True
+                    resultado["guino"] = True
                     resultado["mensaje"] = f"Rostro reconocido: {resultado['nombre']}. GUIÑO detectado - EMERGENCIA"
                     resultado["activar_rele"] = False
                     logging.info(resultado["mensaje"])
@@ -125,19 +138,19 @@ def procesar_imagen(ruta_imagen):
                     if imagen_cv is not None:
                         cv2.imwrite(alerta, imagen_cv)
                 else:
-                    resultado["guiño"] = False
+                    resultado["guino"] = False
                     resultado["mensaje"] = f"Rostro reconocido: {resultado['nombre']}. Sin guiño"
                     resultado["activar_rele"] = True
                     logging.info(resultado["mensaje"])
                     enviar_mensaje_whatsapp(f"✅ Acceso permitido: {resultado['nombre']} (sin guiño).")
             except Exception as e:
                 logging.error(f"Error en detección de guiño: {e}")
-                resultado["guiño"] = False
+                resultado["guino"] = False
                 resultado["activar_rele"] = True
         else:
             resultado["reconocido"] = False
             resultado["nombre"] = None
-            resultado["guiño"] = False
+            resultado["guino"] = False
             resultado["activar_rele"] = False
             resultado["mensaje"] = "Rostro NO reconocido"
             logging.info("❌ Rostro no reconocido")
@@ -195,7 +208,7 @@ def recibir():
     return jsonify({
         "reconocido": resultado["reconocido"],
         "nombre": resultado["nombre"],
-        "guino": resultado["guiño"],
+        "guino": resultado["guino"],
         "activar_rele": resultado["activar_rele"],
         "mensaje": resultado["mensaje"]
     }), 200
