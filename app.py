@@ -15,10 +15,8 @@ os.makedirs(BASE_ROSTROS_FOLDER, exist_ok=True)
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB
 
-# --- Inicializar MediaPipe (solo Face Detection, NO Face Mesh) ---
+# --- Inicializar MediaPipe (solo Face Detection) ---
 mp_face_detection = mp.solutions.face_detection
-# model_selection=0 para distancias cortas (menos de 2 metros)
-# model_selection=1 para distancias lejanas (mayor rendimiento)
 face_detector = mp_face_detection.FaceDetection(
     model_selection=0,
     min_detection_confidence=0.5
@@ -26,14 +24,11 @@ face_detector = mp_face_detection.FaceDetection(
 
 logging.basicConfig(level=logging.INFO)
 
-# --- Base de rostros conocidos (embeddings simples) ---
-known_faces = {}  # {nombre: embedding}
+# --- Base de rostros conocidos ---
+known_faces = {}
 
 def extract_simple_embedding(img):
-    """
-    Extrae un embedding simple del rostro detectado
-    Usa solo los puntos clave de Face Detection (6 puntos)
-    """
+    """Extrae embedding simple de los 6 puntos clave de Face Detection"""
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     resultados = face_detector.process(rgb)
     
@@ -43,7 +38,6 @@ def extract_simple_embedding(img):
     deteccion = resultados.detections[0]
     keypoints = deteccion.location_data.relative_keypoints
     
-    # Extraer coordenadas de los 6 puntos clave
     embedding = []
     for kp in keypoints:
         embedding.append(kp.x)
@@ -52,7 +46,6 @@ def extract_simple_embedding(img):
     return np.array(embedding)
 
 def load_known_faces():
-    """Carga rostros conocidos y calcula sus embeddings simples"""
     global known_faces
     known_faces = {}
     
@@ -76,10 +69,6 @@ def load_known_faces():
     logging.info(f"📊 Total rostros cargados: {len(known_faces)}")
 
 def reconocer_rostro_simple(embedding, threshold=0.15):
-    """
-    Compara embedding con rostros conocidos usando distancia euclidiana
-    Threshold más bajo = más preciso (0.10-0.20 recomendado)
-    """
     if embedding is None or len(known_faces) == 0:
         return None, 0
     
@@ -87,23 +76,18 @@ def reconocer_rostro_simple(embedding, threshold=0.15):
     mejor_distancia = float('inf')
     
     for nombre, known_embedding in known_faces.items():
-        # Distancia euclidiana (más rápida que cosine_similarity)
         distancia = np.linalg.norm(embedding - known_embedding)
         if distancia < mejor_distancia:
             mejor_distancia = distancia
             mejor_nombre = nombre
     
     if mejor_distancia <= threshold:
-        # Convertir distancia a porcentaje de confianza
         confianza = max(0, min(100, (1 - mejor_distancia / threshold) * 100))
         return mejor_nombre, confianza
     return None, 0
 
 def detectar_guino_rapido(imagen):
-    """
-    Detecta guiño usando los puntos clave de Face Detection
-    Muy rápido (~10-20ms por imagen)
-    """
+    """Detecta guiño usando puntos clave de Face Detection"""
     try:
         rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
         resultados = face_detector.process(rgb)
@@ -114,47 +98,28 @@ def detectar_guino_rapido(imagen):
         deteccion = resultados.detections[0]
         keypoints = deteccion.location_data.relative_keypoints
         
-        # keypoints[0] = ojo izquierdo
-        # keypoints[1] = ojo derecho
-        # keypoints[2] = nariz
-        # keypoints[3] = boca
-        # keypoints[4] = oreja izquierda
-        # keypoints[5] = oreja derecha
-        
-        # Calcular altura relativa de cada ojo
-        # Usamos una aproximación: la posición Y del ojo indica apertura
-        # Un ojo cerrado tiene un valor Y más alto (porque el párpado baja)
-        
         altura_ojo_izq = keypoints[0].y
         altura_ojo_der = keypoints[1].y
         altura_nariz = keypoints[2].y
         
-        # Normalizar respecto a la nariz
         diff_izq = abs(altura_ojo_izq - altura_nariz)
         diff_der = abs(altura_ojo_der - altura_nariz)
         
-        # Un ojo cerrado tiene mayor diferencia con la nariz
-        umbral = 0.045  # Ajustar según pruebas
+        umbral = 0.045
         
-        # Guiño: un ojo significativamente más cerrado que el otro
         if diff_izq > umbral and diff_der < umbral * 0.6:
             return True
         if diff_der > umbral and diff_izq < umbral * 0.6:
             return True
             
         return False
-        
     except Exception as e:
         logging.warning(f"Error en detección de guiño: {e}")
         return False
 
 def procesar_una_foto(img):
-    """
-    Procesa una foto individual: detección de rostro, reconocimiento y guiño
-    Tiempo estimado: 50-150ms por foto
-    """
+    """Procesa una sola foto y devuelve resultado"""
     try:
-        # Detectar rostro
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         detections = face_detector.process(rgb)
         
@@ -167,9 +132,7 @@ def procesar_una_foto(img):
                 "confianza": 0
             }
         
-        # Extraer embedding para reconocimiento
         embedding = extract_simple_embedding(img)
-        
         if embedding is None:
             return {
                 "rostro_detectado": True,
@@ -179,10 +142,7 @@ def procesar_una_foto(img):
                 "confianza": 0
             }
         
-        # Reconocer rostro
         nombre, confianza = reconocer_rostro_simple(embedding)
-        
-        # Detectar guiño (solo si hay rostro)
         tiene_guino = detectar_guino_rapido(img)
         
         return {
@@ -192,7 +152,6 @@ def procesar_una_foto(img):
             "confianza": round(confianza, 2),
             "guino": tiene_guino
         }
-        
     except Exception as e:
         logging.error(f"Error procesando foto: {e}")
         return {
@@ -215,34 +174,38 @@ def index():
 
 @app.route("/recibir", methods=["POST"])
 def recibir():
-    """Endpoint que recibe las 3 fotos y devuelve la decisión final"""
     start_time = datetime.now()
     
     try:
-        # Verificar si es JSON con base64 o binario directo
+        # Obtener datos según Content-Type
         if request.headers.get('Content-Type') == 'application/json':
             data = request.get_json()
             if not data or 'fotos' not in data:
                 return jsonify({"error": "No se recibieron fotos"}), 400
             
             fotos_b64 = data['fotos']
-            if len(fotos_b64) != 3:
-                return jsonify({"error": f"Se esperaban 3 fotos, se recibieron {len(fotos_b64)}"}), 400
+            if not isinstance(fotos_b64, list):
+                fotos_b64 = [fotos_b64]  # Si es una sola foto, convertir a lista
             
-            # Procesar cada foto
+            logging.info(f"📥 Recibidas {len(fotos_b64)} fotos")
+            
             resultados = []
             for i, foto_b64 in enumerate(fotos_b64):
-                img_data = base64.b64decode(foto_b64)
-                nparr = np.frombuffer(img_data, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                if img is not None:
-                    resultado = procesar_una_foto(img)
-                    resultados.append(resultado)
-                    logging.info(f"📸 Foto {i+1}: {resultado}")
-                else:
-                    resultados.append({"error": "Decodificación fallida"})
-            
+                try:
+                    img_data = base64.b64decode(foto_b64)
+                    nparr = np.frombuffer(img_data, np.uint8)
+                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    
+                    if img is not None:
+                        resultado = procesar_una_foto(img)
+                        resultados.append(resultado)
+                        logging.info(f"📸 Foto {i+1}: reconocido={resultado.get('reconocido')}, guiño={resultado.get('guino')}")
+                    else:
+                        resultados.append({"error": "Decodificación fallida"})
+                except Exception as e:
+                    logging.error(f"Error decodificando foto {i+1}: {e}")
+                    resultados.append({"error": str(e)})
+        
         else:
             # Modo binario directo (una sola foto)
             raw_data = request.get_data()
@@ -258,12 +221,7 @@ def recibir():
             resultado = procesar_una_foto(img)
             resultados = [resultado]
         
-        # Determinar respuesta final basada en las 3 fotos
-        # Reglas:
-        # 1. Si ALGUNA foto tiene guiño -> BLOQUEAR
-        # 2. Si ALGUNA foto tiene rostro reconocido SIN guiño -> ACTIVAR
-        # 3. Si ninguna foto reconoce rostro -> NO ACTIVAR
-        
+        # Determinar respuesta final
         fotos_con_guiño = [r for r in resultados if r.get('guino', False)]
         fotos_reconocidas_sin_guino = [
             r for r in resultados 
@@ -273,7 +231,6 @@ def recibir():
         tiempo_procesamiento = (datetime.now() - start_time).total_seconds()
         
         if fotos_con_guiño:
-            # Hay guiño en al menos una foto
             respuesta = {
                 "activar_rele": False,
                 "motivo": "guiño_detectado",
@@ -284,7 +241,6 @@ def recibir():
             logging.info(f"🚫 RESULTADO: Guiño detectado - Acceso DENEGADO")
             
         elif fotos_reconocidas_sin_guino:
-            # Obtener el nombre del primer rostro reconocido sin guiño
             nombre = fotos_reconocidas_sin_guino[0].get('nombre', 'Desconocido')
             confianza = fotos_reconocidas_sin_guino[0].get('confianza', 0)
             
