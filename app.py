@@ -2,7 +2,6 @@ import os
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify
-import mediapipe as mp
 import base64
 import logging
 from datetime import datetime
@@ -14,51 +13,58 @@ os.makedirs(BASE_ROSTROS_FOLDER, exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 
 # ==================================================
-# CONFIGURACIÓN CRÍTICA PARA 0.1 CPU / 512 MB RAM
+# CONFIGURACIÓN PARA 0.1 CPU / 512 MB RAM
+# Solo OpenCV - Sin MediaPipe, TensorFlow, etc.
 # ==================================================
-mp_face_detection = mp.solutions.face_detection
 
-# Usar model_selection=0 (distancias cortas) que es MÁS RÁPIDO
-# Reducir min_detection_confidence para más detecciones (0.3 en lugar de 0.5)
-face_detector = mp_face_detection.FaceDetection(
-    model_selection=0,           # 0 = corta distancia (<2m), MÁS RÁPIDO
-    min_detection_confidence=0.3 # Más bajo = más detecciones, menos precisión
-)
-# ==================================================
+# Clasificadores Haar Cascade
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
 # Estructura para almacenar rostros conocidos
-known_face_data = {}  # {nombre: "huella_digital"}
+known_face_histograms = {}  # {nombre: histograma}
 
-def extract_face_signature(img):
+def preprocess_image(img):
+    """Mejora la calidad de la imagen para que se parezca más a las fotos de referencia"""
+    # Convertir a gris
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Ecualizar histograma (mejora contraste)
+    gray = cv2.equalizeHist(gray)
+    # Reducir ruido
+    gray = cv2.medianBlur(gray, 3)
+    # Volver a BGR para mantener compatibilidad (aunque luego se volverá a gris)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+def extract_face_histogram(img):
     """
-    Extrae una "huella digital" del rostro usando solo los keypoints de Face Detection.
-    Esto es ULTRA-RÁPIDO porque NO usa Face Mesh.
+    Extrae histograma del rostro usando OpenCV.
+    Tiempo estimado: 20-30ms.
     """
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = face_detector.process(rgb)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
     
-    if not results.detections:
-        return None
+    if len(faces) == 0:
+        return None, None
     
-    # Tomamos el primer rostro detectado
-    detection = results.detections[0]
-    keypoints = detection.location_data.relative_keypoints
+    x, y, w, h = faces[0]
+    face_roi = gray[y:y+h, x:x+w]
     
-    # Face Detection tiene 6 keypoints:
-    # 0: ojo izquierdo, 1: ojo derecho, 2: nariz, 3: boca, 4: oreja izq, 5: oreja der
-    signature = []
-    for kp in keypoints:
-        signature.append(kp.x)
-        signature.append(kp.y)
+    # Reducir tamaño para acelerar
+    face_small = cv2.resize(face_roi, (32, 32))
     
-    return np.array(signature)
+    # Histograma de 32 bins
+    hist = cv2.calcHist([face_small], [0], None, [32], [0, 256])
+    hist = cv2.normalize(hist, hist).flatten()
+    
+    return hist, (x, y, w, h)
 
 def load_known_faces():
-    """Carga rostros conocidos (solo sus signatures)"""
-    global known_face_data
-    known_face_data = {}
+    """Carga rostros conocidos (fotos del POCO F5 Pro)"""
+    global known_face_histograms
+    known_face_histograms = {}
     
     if not os.path.exists(BASE_ROSTROS_FOLDER):
+        logging.warning(f"⚠️ Carpeta {BASE_ROSTROS_FOLDER} no existe")
         return
     
     for filename in os.listdir(BASE_ROSTROS_FOLDER):
@@ -66,72 +72,68 @@ def load_known_faces():
             img_path = os.path.join(BASE_ROSTROS_FOLDER, filename)
             img = cv2.imread(img_path)
             if img is not None:
-                signature = extract_face_signature(img)
-                if signature is not None:
+                # Preprocesar también las imágenes de referencia (opcional)
+                img_proc = preprocess_image(img)
+                hist, face_rect = extract_face_histogram(img_proc)
+                if hist is not None:
                     nombre = filename.rsplit('.', 1)[0]
-                    known_face_data[nombre] = signature
+                    known_face_histograms[nombre] = hist
                     logging.info(f"✅ Rostro registrado: {nombre}")
                 else:
                     logging.warning(f"⚠️ No se detectó rostro en: {filename}")
     
-    logging.info(f"📊 Total rostros cargados: {len(known_face_data)}")
+    logging.info(f"📊 Total rostros cargados: {len(known_face_histograms)}")
 
-def recognize_face_fast(img, threshold=0.25):
+def recognize_face_histogram(img, threshold=0.25):
     """
-    Reconocimiento facial ULTRA-RÁPIDO usando distancia euclidiana entre signatures.
-    Tiempo estimado: 50-100ms por foto.
+    Reconoce rostro comparando histogramas usando Bhattacharyya (más tolerante).
+    Tiempo estimado: 30-50ms.
     """
-    signature = extract_face_signature(img)
-    if signature is None or len(known_face_data) == 0:
-        return None, 0
+    hist, face_rect = extract_face_histogram(img)
+    if hist is None or len(known_face_histograms) == 0:
+        return None, 0, None
     
     best_name = None
-    best_distance = float('inf')
+    best_score = float('inf')  # Para Bhattacharyya, menor = mejor coincidencia
     
-    for name, known_sig in known_face_data.items():
-        distance = np.linalg.norm(signature - known_sig)
-        if distance < best_distance:
-            best_distance = distance
+    for name, known_hist in known_face_histograms.items():
+        # Usar Bhattacharyya en lugar de correlación (más flexible)
+        score = cv2.compareHist(hist, known_hist, cv2.HISTCMP_BHATTACHARYYA)
+        if score < best_score:
+            best_score = score
             best_name = name
     
-    # Convertir distancia a porcentaje (ajustado para ser más tolerante)
-    confidence = max(0, min(100, 100 - (best_distance / 0.35 * 100)))
-    
-    if confidence >= threshold * 100:
-        return best_name, round(confidence, 2)
-    return None, 0
+    # Convertir score (0 = perfecto, 1 = muy diferente) a porcentaje de confianza
+    # Si best_score < threshold, consideramos coincidencia
+    if best_score < threshold:
+        confidence = max(0, min(100, (1 - best_score / threshold) * 100))
+        return best_name, round(confidence, 2), face_rect
+    return None, 0, None
 
-def detect_wink_fast(img):
+def detect_wink_haar(img, face_rect):
     """
-    Detección de GUIÑO usando Face Detection (NO Face Mesh).
-    Un guiño ocurre cuando un ojo está significativamente más bajo que el otro.
+    Detecta guiño usando clasificadores de ojos Haar.
+    Tiempo estimado: 10-20ms.
     """
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = face_detector.process(rgb)
-    
-    if not results.detections:
+    if face_rect is None:
         return False
     
-    detection = results.detections[0]
-    keypoints = detection.location_data.relative_keypoints
+    x, y, w, h = face_rect
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    face_roi = gray[y:y+h, x:x+w]
     
-    # keypoints[0] = ojo izquierdo, keypoints[1] = ojo derecho
-    left_eye_y = keypoints[0].y
-    right_eye_y = keypoints[1].y
+    eyes = eye_cascade.detectMultiScale(face_roi, scaleFactor=1.05, minNeighbors=3, minSize=(15, 15))
     
-    # Calcular diferencia de altura entre ojos
-    eye_diff = abs(left_eye_y - right_eye_y)
-    
-    # Si la diferencia es grande (>0.03), puede ser un guiño
-    # Ajusta este valor según tus pruebas
-    return eye_diff > 0.025
+    # Si se detectan menos de 2 ojos, puede ser un guiño
+    return len(eyes) < 2
 
 @app.route("/")
 def index():
     return jsonify({
         "status": "online",
-        "servicio": "Reconocimiento Facial Ultra-Rápido",
-        "rostros_cargados": len(known_face_data)
+        "servicio": "Reconocimiento Facial con OpenCV (mejorado)",
+        "rostros_cargados": len(known_face_histograms),
+        "mensaje": "Optimizado para fotos ESP32-CAM vs POCO F5 Pro"
     })
 
 @app.route("/recibir", methods=["POST"])
@@ -151,19 +153,20 @@ def recibir():
         if img is None:
             return jsonify({"error": "Error decodificando imagen", "activar_rele": False}), 400
         
-        # REDUCIR RESOLUCIÓN para acelerar (opcional, pero recomendado)
-        # 320x240 es suficiente para detección y reduce el tiempo a la mitad
-        # img = cv2.resize(img, (320, 240))
+        # Mejorar calidad de la imagen del ESP32-CAM
+        img = preprocess_image(img)
+        # Opcional: reducir resolución para acelerar (comentar si no quieres)
+        img = cv2.resize(img, (320, 240))
         
         logging.info(f"📥 Foto recibida ({len(img_data)} bytes)")
         
-        # Reconocimiento facial (50-100ms)
-        nombre, confianza = recognize_face_fast(img)
+        # Reconocimiento facial
+        nombre, confianza, face_rect = recognize_face_histogram(img)
         tiempo = (datetime.now() - start_time).total_seconds()
         
         if nombre:
-            # Detectar guiño (solo si hay rostro, 20-30ms adicionales)
-            tiene_guino = detect_wink_fast(img)
+            # Detectar guiño
+            tiene_guino = detect_wink_haar(img, face_rect)
             
             if tiene_guino:
                 logging.info(f"👁️ {nombre} - GUIÑO detectado (bloquear) - {tiempo:.2f}s")
@@ -201,4 +204,5 @@ load_known_faces()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    logging.info(f"🚀 Servidor iniciando en puerto {port}")
     app.run(debug=False, host="0.0.0.0", port=port)
