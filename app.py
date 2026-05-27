@@ -22,16 +22,28 @@ logging.basicConfig(level=logging.INFO)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
-# --- Almacenamiento temporal de lotes ---
+# --- Almacenamiento temporal de lotes (para acumular 3 fotos y enviar 1 WhatsApp) ---
 pending_batches = {}
+
 known_face_histograms = {}
 
+# ============================================================
+# 1. Preprocesamiento de imagen (mejorado con CLAHE)
+# ============================================================
 def preprocess_image(img):
+    """Mejora la calidad de la imagen usando CLAHE y filtro bilateral."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    gray = cv2.medianBlur(gray, 3)
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization) – mejor que ecualización simple
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    # Filtro bilateral (reduce ruido pero conserva bordes)
+    gray = cv2.bilateralFilter(gray, 5, 50, 50)
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
+
+# ============================================================
+# 2. Envío de mensajes WhatsApp (CallMeBot)
+# ============================================================
 def send_whatsapp_message(message):
     try:
         encoded_message = urllib.parse.quote(message)
@@ -44,7 +56,12 @@ def send_whatsapp_message(message):
     except Exception as e:
         logging.error(f"Excepción WhatsApp: {e}")
 
+
+# ============================================================
+# 3. Extracción de histograma facial (huella digital)
+# ============================================================
 def extract_face_histogram(img):
+    """Extrae histograma del rostro detectado (usado para reconocimiento)."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
     if len(faces) == 0:
@@ -56,6 +73,10 @@ def extract_face_histogram(img):
     hist = cv2.normalize(hist, hist).flatten()
     return hist, (x, y, w, h)
 
+
+# ============================================================
+# 4. Carga de rostros conocidos (base_rostros)
+# ============================================================
 def load_known_faces():
     global known_face_histograms
     known_face_histograms = {}
@@ -74,7 +95,11 @@ def load_known_faces():
                     logging.info(f"Rostro registrado: {nombre}")
     logging.info(f"Total rostros: {len(known_face_histograms)}")
 
-def recognize_face_histogram(img, threshold=0.30):  # Umbral más tolerante
+
+# ============================================================
+# 5. Reconocimiento facial (comparación de histogramas)
+# ============================================================
+def recognize_face_histogram(img, threshold=0.30):   # Umbral más tolerante
     hist, face_rect = extract_face_histogram(img)
     if hist is None or len(known_face_histograms) == 0:
         return None, 0, None
@@ -90,43 +115,64 @@ def recognize_face_histogram(img, threshold=0.30):  # Umbral más tolerante
         return best_name, round(float(confidence), 2), face_rect
     return None, 0, None
 
+
+# ============================================================
+# 6. Detección de GUIÑO (ultrasensible para ojos pequeños)
+# ============================================================
 def detect_wink_lightweight(img, face_rect):
-    """Detecta guiño con parámetros ajustados para mayor precisión."""
+    """
+    Detecta guiño con parámetros optimizados para ojos pequeños y máxima sensibilidad.
+    - minSize=(5,5) : captura ojos muy pequeños
+    - minNeighbors=1 : máxima sensibilidad (puede dar falsos positivos, compensamos con asimetría)
+    - Umbral de asimetría bajo (0.12) para detectar guiños sutiles
+    """
     if face_rect is None:
         return False
     x, y, w, h = face_rect
     if w <= 0 or h <= 0:
         return False
+
     face_roi = img[y:y+h, x:x+w]
     if face_roi.size == 0:
         return False
+
     gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-    # Mejorar contraste para resaltar ojos
-    gray_face = cv2.equalizeHist(gray_face)
-    
+    # CLAHE local para realzar el contraste de los ojos
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_face = clahe.apply(gray_face)
+
     half = w // 2
     left_half = gray_face[:, :half]
     right_half = gray_face[:, half:]
-    
-    # Detección de ojos más sensible
-    eyes_left = eye_cascade.detectMultiScale(left_half, scaleFactor=1.05, minNeighbors=2, minSize=(10, 10))
-    eyes_right = eye_cascade.detectMultiScale(right_half, scaleFactor=1.05, minNeighbors=2, minSize=(10, 10))
+
+    # Detección de ojos con parámetros muy sensibles
+    eyes_left = eye_cascade.detectMultiScale(left_half, scaleFactor=1.03, minNeighbors=1, minSize=(5, 5))
+    eyes_right = eye_cascade.detectMultiScale(right_half, scaleFactor=1.03, minNeighbors=1, minSize=(5, 5))
     total_eyes = len(eyes_left) + len(eyes_right)
-    
+
+    # Cálculo de asimetría de brillo
     mean_left = np.mean(left_half) if left_half.size > 0 else 0
     mean_right = np.mean(right_half) if right_half.size > 0 else 0
     if max(mean_left, mean_right) == 0:
         asymmetry = 0.0
     else:
         asymmetry = float(abs(mean_left - mean_right) / max(mean_left, mean_right))
-    
-    # Condiciones mejoradas
+
+    ASYMMETRY_THRESHOLD = 0.12   # Bajo = más sensible
+
+    # Reglas de decisión mejoradas
     if total_eyes == 1:
         return True
-    if total_eyes < 2 and asymmetry > 0.20:
+    if total_eyes == 0 and asymmetry > ASYMMETRY_THRESHOLD:
+        return True
+    if total_eyes == 2 and asymmetry > 0.25:   # asimetría muy alta a pesar de dos ojos
         return True
     return False
 
+
+# ============================================================
+# 7. Endpoint principal /recibir (procesa foto por foto con batch)
+# ============================================================
 @app.route("/")
 def index():
     return jsonify({
@@ -150,17 +196,20 @@ def recibir():
         if img is None:
             return jsonify({"error": "Error decodificando imagen", "activar_rele": False}), 400
 
+        # Preprocesamiento (CLAHE + bilateral)
         img = preprocess_image(img)
-        # Redimensionar opcional para acelerar (comentar si se prefiere más calidad)
+        # (Opcional) Redimensionar para acelerar – descomentar si se desea:
         # img = cv2.resize(img, (320, 240))
 
         logging.info(f"Batch {batch_id} - Foto recibida ({len(img_data)} bytes)")
 
+        # --- Reconocimiento facial ---
         nombre, confianza, face_rect = recognize_face_histogram(img)
         tiene_guino = False
         if nombre:
             tiene_guino = detect_wink_lightweight(img, face_rect)
 
+        # Respuesta individual (para el ESP32)
         individual_response = {
             "activar_rele": bool(nombre is not None and not tiene_guino),
             "nombre": nombre if nombre else None,
@@ -168,6 +217,7 @@ def recibir():
             "guino": bool(tiene_guino)
         }
 
+        # --- Almacenar en el lote ---
         if batch_id not in pending_batches:
             pending_batches[batch_id] = {
                 "count": 0,
@@ -178,12 +228,14 @@ def recibir():
         batch["count"] += 1
         batch["results"].append(individual_response)
 
+        # --- Si ya tenemos 3 fotos, calcular resultado final y enviar WhatsApp (una sola vez) ---
         if batch["count"] >= 3 and not batch["final_notified"]:
             batch["final_notified"] = True
             any_wink = any(r.get("guino", False) for r in batch["results"])
             any_recognized_no_wink = any(r.get("activar_rele", False) for r in batch["results"])
 
             if any_wink:
+                # Obtener el nombre de la persona que hizo el guiño (si se reconoció)
                 names = [r.get("nombre") for r in batch["results"] if r.get("nombre")]
                 name_str = names[0] if names else "Desconocido"
                 final_message = f"⚠️ Timbre activado. Rostro reconocido: {name_str}. Se detectó un GUIÑO (posible emergencia)."
@@ -203,6 +255,7 @@ def recibir():
                 logging.info(f"Batch {batch_id} - Resultado final: DENEGADO")
                 send_whatsapp_message(final_message)
 
+            # Limpiar lote para liberar memoria
             del pending_batches[batch_id]
 
         return jsonify(individual_response), 200
@@ -211,6 +264,10 @@ def recibir():
         logging.error(f"Error en /recibir: {e}")
         return jsonify({"error": str(e), "activar_rele": False}), 500
 
+
+# ============================================================
+# 8. Inicio del servidor
+# ============================================================
 load_known_faces()
 
 if __name__ == "__main__":
