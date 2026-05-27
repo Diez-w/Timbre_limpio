@@ -24,7 +24,6 @@ eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml
 
 # --- Almacenamiento temporal de lotes ---
 pending_batches = {}
-
 known_face_histograms = {}
 
 def preprocess_image(img):
@@ -75,7 +74,7 @@ def load_known_faces():
                     logging.info(f"Rostro registrado: {nombre}")
     logging.info(f"Total rostros: {len(known_face_histograms)}")
 
-def recognize_face_histogram(img, threshold=0.25):
+def recognize_face_histogram(img, threshold=0.30):  # Umbral más tolerante
     hist, face_rect = extract_face_histogram(img)
     if hist is None or len(known_face_histograms) == 0:
         return None, 0, None
@@ -92,24 +91,41 @@ def recognize_face_histogram(img, threshold=0.25):
     return None, 0, None
 
 def detect_wink_lightweight(img, face_rect):
+    """Detecta guiño con parámetros ajustados para mayor precisión."""
     if face_rect is None:
         return False
     x, y, w, h = face_rect
+    if w <= 0 or h <= 0:
+        return False
     face_roi = img[y:y+h, x:x+w]
+    if face_roi.size == 0:
+        return False
     gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+    # Mejorar contraste para resaltar ojos
+    gray_face = cv2.equalizeHist(gray_face)
+    
     half = w // 2
     left_half = gray_face[:, :half]
     right_half = gray_face[:, half:]
-    eyes_left = eye_cascade.detectMultiScale(left_half, scaleFactor=1.05, minNeighbors=3, minSize=(10, 10))
-    eyes_right = eye_cascade.detectMultiScale(right_half, scaleFactor=1.05, minNeighbors=3, minSize=(10, 10))
+    
+    # Detección de ojos más sensible
+    eyes_left = eye_cascade.detectMultiScale(left_half, scaleFactor=1.05, minNeighbors=2, minSize=(10, 10))
+    eyes_right = eye_cascade.detectMultiScale(right_half, scaleFactor=1.05, minNeighbors=2, minSize=(10, 10))
     total_eyes = len(eyes_left) + len(eyes_right)
+    
     mean_left = np.mean(left_half) if left_half.size > 0 else 0
     mean_right = np.mean(right_half) if right_half.size > 0 else 0
     if max(mean_left, mean_right) == 0:
         asymmetry = 0.0
     else:
         asymmetry = float(abs(mean_left - mean_right) / max(mean_left, mean_right))
-    return (total_eyes < 2) or (asymmetry > 0.15)
+    
+    # Condiciones mejoradas
+    if total_eyes == 1:
+        return True
+    if total_eyes < 2 and asymmetry > 0.20:
+        return True
+    return False
 
 @app.route("/")
 def index():
@@ -135,17 +151,16 @@ def recibir():
             return jsonify({"error": "Error decodificando imagen", "activar_rele": False}), 400
 
         img = preprocess_image(img)
-        # img = cv2.resize(img, (320, 240))  # opcional
+        # Redimensionar opcional para acelerar (comentar si se prefiere más calidad)
+        # img = cv2.resize(img, (320, 240))
 
         logging.info(f"Batch {batch_id} - Foto recibida ({len(img_data)} bytes)")
 
-        # --- Reconocimiento de esta foto ---
         nombre, confianza, face_rect = recognize_face_histogram(img)
         tiene_guino = False
         if nombre:
             tiene_guino = detect_wink_lightweight(img, face_rect)
 
-        # Construir respuesta individual CONVINIENDO tipos nativos
         individual_response = {
             "activar_rele": bool(nombre is not None and not tiene_guino),
             "nombre": nombre if nombre else None,
@@ -153,7 +168,6 @@ def recibir():
             "guino": bool(tiene_guino)
         }
 
-        # --- Almacenar resultado para el lote ---
         if batch_id not in pending_batches:
             pending_batches[batch_id] = {
                 "count": 0,
@@ -164,7 +178,6 @@ def recibir():
         batch["count"] += 1
         batch["results"].append(individual_response)
 
-        # --- Si ya llevamos 3 fotos, calcular resultado final y enviar WhatsApp (solo una vez) ---
         if batch["count"] >= 3 and not batch["final_notified"]:
             batch["final_notified"] = True
             any_wink = any(r.get("guino", False) for r in batch["results"])
@@ -174,7 +187,7 @@ def recibir():
                 names = [r.get("nombre") for r in batch["results"] if r.get("nombre")]
                 name_str = names[0] if names else "Desconocido"
                 final_message = f"⚠️ Timbre activado. Rostro reconocido: {name_str}. Se detectó un GUIÑO (posible emergencia)."
-                logging.info(f"Batch {batch_id} - Resultado final: GUIÑO - {final_message}")
+                logging.info(f"Batch {batch_id} - Resultado final: GUIÑO")
                 send_whatsapp_message(final_message)
             elif any_recognized_no_wink:
                 for r in batch["results"]:
@@ -183,14 +196,13 @@ def recibir():
                         break
                 else:
                     final_message = "✅ Timbre activado. Rostro reconocido. Sin guiño."
-                logging.info(f"Batch {batch_id} - Resultado final: PERMITIDO - {final_message}")
+                logging.info(f"Batch {batch_id} - Resultado final: PERMITIDO")
                 send_whatsapp_message(final_message)
             else:
                 final_message = "❗ Timbre activado. Rostro NO reconocido."
-                logging.info(f"Batch {batch_id} - Resultado final: DENEGADO - {final_message}")
+                logging.info(f"Batch {batch_id} - Resultado final: DENEGADO")
                 send_whatsapp_message(final_message)
 
-            # Limpiar lote
             del pending_batches[batch_id]
 
         return jsonify(individual_response), 200
