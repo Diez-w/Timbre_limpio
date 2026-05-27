@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify
-from fer import FER
+import face_recognition
 import base64
 import logging
 from datetime import datetime
@@ -13,35 +13,15 @@ os.makedirs(BASE_ROSTROS_FOLDER, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
 
-# Inicializar FER para detección de emociones (guiños)
-emotion_detector = FER(mtcnn=False)
-
-# Estructura para rostros conocidos
-known_faces_data = {}
-
-def extract_face(img):
-    """Extrae rostro usando Haar Cascade de OpenCV"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-    
-    if len(faces) == 0:
-        return None
-    x, y, w, h = faces[0]
-    return img[y:y+h, x:x+w]
-
-def preprocess_face(face_img):
-    """Preprocesa rostro para comparación (50x50, ecualizado)"""
-    if face_img is None:
-        return None
-    gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    return cv2.resize(gray, (50, 50))
+# Estructura para almacenar codificaciones faciales
+known_face_encodings = []
+known_face_names = []
 
 def load_known_faces():
-    """Carga rostros conocidos desde base_rostros"""
-    global known_faces_data
-    known_faces_data = {}
+    """Carga rostros conocidos usando face_recognition"""
+    global known_face_encodings, known_face_names
+    known_face_encodings = []
+    known_face_names = []
     
     if not os.path.exists(BASE_ROSTROS_FOLDER):
         logging.warning(f"⚠️ Carpeta {BASE_ROSTROS_FOLDER} no existe")
@@ -50,76 +30,50 @@ def load_known_faces():
     for filename in os.listdir(BASE_ROSTROS_FOLDER):
         if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
             img_path = os.path.join(BASE_ROSTROS_FOLDER, filename)
-            img = cv2.imread(img_path)
-            if img is not None:
-                face = extract_face(img)
-                if face is not None:
-                    nombre = filename.rsplit('.', 1)[0]
-                    processed = preprocess_face(face)
-                    if processed is not None:
-                        known_faces_data[nombre] = processed.flatten()
-                        logging.info(f"✅ Rostro registrado: {nombre}")
-                    else:
-                        logging.warning(f"⚠️ Error preprocesando: {filename}")
-                else:
-                    logging.warning(f"⚠️ No se detectó rostro en: {filename}")
-    
-    logging.info(f"📊 Total rostros cargados: {len(known_faces_data)}")
-
-def recognize_face(img, threshold=0.3):
-    """Reconoce rostro por comparación de histogramas"""
-    face = extract_face(img)
-    if face is None:
-        return None, 0
-    
-    query = preprocess_face(face)
-    if query is None:
-        return None, 0
-    
-    query_vector = query.flatten()
-    
-    if len(known_faces_data) == 0:
-        return None, 0
-    
-    mejor_nombre = None
-    mejor_distancia = float('inf')
-    
-    for nombre, known_vector in known_faces_data.items():
-        distancia = np.linalg.norm(query_vector - known_vector)
-        if distancia < mejor_distancia:
-            mejor_distancia = distancia
-            mejor_nombre = nombre
-    
-    confianza = max(0, min(100, 100 - (mejor_distancia / 30)))
-    
-    if confianza >= threshold * 100:
-        return mejor_nombre, round(confianza, 2)
-    return None, 0
-
-def detectar_guino(img):
-    """Detecta guiño usando FER (happy/surprise)"""
-    try:
-        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        emociones = emotion_detector.detect_emotions(rgb_img)
-        
-        if emociones:
-            emocion_data = emociones[0]['emotions']
-            happy = emocion_data.get('happy', 0)
-            surprise = emocion_data.get('surprise', 0)
+            img = face_recognition.load_image_file(img_path)
+            encodings = face_recognition.face_encodings(img)
             
-            if happy > 0.6 or surprise > 0.6:
-                return True
-    except Exception as e:
-        logging.warning(f"Error en detección FER: {e}")
-    return False
+            if encodings:
+                nombre = filename.rsplit('.', 1)[0]
+                known_face_encodings.append(encodings[0])
+                known_face_names.append(nombre)
+                logging.info(f"✅ Rostro registrado: {nombre}")
+            else:
+                logging.warning(f"⚠️ No se detectó rostro en: {filename}")
+    
+    logging.info(f"📊 Total rostros cargados: {len(known_face_names)}")
+
+def recognize_face(img):
+    """Reconoce rostro usando face_recognition"""
+    # Convertir imagen de BGR (OpenCV) a RGB (face_recognition)
+    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Detectar rostros y obtener codificaciones
+    face_locations = face_recognition.face_locations(rgb_img)
+    face_encodings = face_recognition.face_encodings(rgb_img, face_locations)
+    
+    if not face_encodings:
+        return None, 0
+    
+    # Comparar con rostros conocidos
+    for face_encoding in face_encodings:
+        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+        distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+        
+        if True in matches:
+            best_match_index = np.argmin(distances)
+            if matches[best_match_index]:
+                confianza = (1 - distances[best_match_index]) * 100
+                return known_face_names[best_match_index], round(confianza, 2)
+    
+    return None, 0
 
 @app.route("/")
 def index():
     return jsonify({
         "status": "online",
-        "servicio": "Reconocimiento Facial + Guiño",
-        "rostros_cargados": len(known_faces_data),
-        "mensaje": "Servidor listo para recibir fotos"
+        "servicio": "Reconocimiento Facial",
+        "rostros_cargados": len(known_face_names)
     })
 
 @app.route("/recibir", methods=["POST"])
@@ -142,37 +96,23 @@ def recibir():
         logging.info(f"📥 Foto recibida ({len(img_data)} bytes)")
         
         nombre, confianza = recognize_face(img)
+        tiempo = (datetime.now() - start_time).total_seconds()
         
         if nombre:
-            tiene_guino = detectar_guino(img)
-            tiempo = (datetime.now() - start_time).total_seconds()
-            
-            if tiene_guino:
-                logging.info(f"👁️ {nombre} - GUIÑO detectado (bloquear) - {tiempo:.2f}s")
-                return jsonify({
-                    "activar_rele": False,
-                    "motivo": "guiño",
-                    "nombre": nombre,
-                    "mensaje": f"GUIÑO detectado. Acceso DENEGADO.",
-                    "tiempo": round(tiempo, 2)
-                }), 200
-            else:
-                logging.info(f"✅ {nombre} - reconocido ({confianza}%) - {tiempo:.2f}s")
-                return jsonify({
-                    "activar_rele": True,
-                    "motivo": "reconocido",
-                    "nombre": nombre,
-                    "confianza": confianza,
-                    "mensaje": f"Rostro reconocido: {nombre}. Acceso PERMITIDO.",
-                    "tiempo": round(tiempo, 2)
-                }), 200
+            logging.info(f"✅ {nombre} - reconocido ({confianza}%) - {tiempo:.2f}s")
+            return jsonify({
+                "activar_rele": True,
+                "nombre": nombre,
+                "confianza": confianza,
+                "mensaje": f"Rostro reconocido: {nombre}. Acceso PERMITIDO.",
+                "tiempo": round(tiempo, 2)
+            }), 200
         else:
-            tiempo = (datetime.now() - start_time).total_seconds()
             logging.info(f"❌ Rostro NO reconocido - {tiempo:.2f}s")
             return jsonify({
                 "activar_rele": False,
-                "motivo": "no_reconocido",
                 "mensaje": "Rostro no reconocido. Acceso DENEGADO.",
+                "motivo": "no_reconocido",
                 "tiempo": round(tiempo, 2)
             }), 200
             
@@ -180,6 +120,7 @@ def recibir():
         logging.error(f"Error: {e}")
         return jsonify({"error": str(e), "activar_rele": False}), 500
 
+# Cargar rostros al iniciar
 load_known_faces()
 
 if __name__ == "__main__":
