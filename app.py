@@ -22,13 +22,11 @@ logging.basicConfig(level=logging.INFO)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
-# --- Almacenamiento temporal de lotes (para acumular resultados y enviar 1 solo WhatsApp) ---
-# Estructura: { batch_id: {"count": int, "results": list, "final_notified": bool} }
+# --- Almacenamiento temporal de lotes ---
 pending_batches = {}
 
 known_face_histograms = {}
 
-# --- Funciones auxiliares (preprocesamiento, envío WhatsApp, etc.) ---
 def preprocess_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
@@ -90,7 +88,7 @@ def recognize_face_histogram(img, threshold=0.25):
             best_name = name
     if best_score < threshold:
         confidence = max(0, min(100, (1 - best_score / threshold) * 100))
-        return best_name, round(confidence, 2), face_rect
+        return best_name, round(float(confidence), 2), face_rect
     return None, 0, None
 
 def detect_wink_lightweight(img, face_rect):
@@ -105,15 +103,21 @@ def detect_wink_lightweight(img, face_rect):
     eyes_left = eye_cascade.detectMultiScale(left_half, scaleFactor=1.05, minNeighbors=3, minSize=(10, 10))
     eyes_right = eye_cascade.detectMultiScale(right_half, scaleFactor=1.05, minNeighbors=3, minSize=(10, 10))
     total_eyes = len(eyes_left) + len(eyes_right)
-    mean_left = np.mean(left_half)
-    mean_right = np.mean(right_half)
+    mean_left = np.mean(left_half) if left_half.size > 0 else 0
+    mean_right = np.mean(right_half) if right_half.size > 0 else 0
     if max(mean_left, mean_right) == 0:
-        asymmetry = 0
+        asymmetry = 0.0
     else:
-        asymmetry = abs(mean_left - mean_right) / max(mean_left, mean_right)
+        asymmetry = float(abs(mean_left - mean_right) / max(mean_left, mean_right))
     return (total_eyes < 2) or (asymmetry > 0.15)
 
-# --- Endpoint principal ---
+@app.route("/")
+def index():
+    return jsonify({
+        "status": "online",
+        "rostros_cargados": len(known_face_histograms)
+    })
+
 @app.route("/recibir", methods=["POST"])
 def recibir():
     try:
@@ -131,7 +135,7 @@ def recibir():
             return jsonify({"error": "Error decodificando imagen", "activar_rele": False}), 400
 
         img = preprocess_image(img)
-        # (Opcional) img = cv2.resize(img, (320, 240))
+        # img = cv2.resize(img, (320, 240))  # opcional
 
         logging.info(f"Batch {batch_id} - Foto recibida ({len(img_data)} bytes)")
 
@@ -141,12 +145,12 @@ def recibir():
         if nombre:
             tiene_guino = detect_wink_lightweight(img, face_rect)
 
-        # --- Respuesta individual para el ESP32 (inmediata) ---
+        # Construir respuesta individual CONVINIENDO tipos nativos
         individual_response = {
-            "activar_rele": (nombre is not None and not tiene_guino),
-            "nombre": nombre,
-            "confianza": confianza,
-            "guino": tiene_guino
+            "activar_rele": bool(nombre is not None and not tiene_guino),
+            "nombre": nombre if nombre else None,
+            "confianza": float(confianza) if nombre else 0,
+            "guino": bool(tiene_guino)
         }
 
         # --- Almacenar resultado para el lote ---
@@ -163,22 +167,16 @@ def recibir():
         # --- Si ya llevamos 3 fotos, calcular resultado final y enviar WhatsApp (solo una vez) ---
         if batch["count"] >= 3 and not batch["final_notified"]:
             batch["final_notified"] = True
-            # Lógica final:
-            # - Si alguna foto tuvo guiño → bloqueado + emergencia
-            # - Si alguna foto tuvo reconocido sin guiño → permitido
-            # - Si no hay reconocido en ninguna → denegado
             any_wink = any(r.get("guino", False) for r in batch["results"])
             any_recognized_no_wink = any(r.get("activar_rele", False) for r in batch["results"])
 
             if any_wink:
-                # Buscar nombre de la persona que hizo el guiño (si se reconoció)
                 names = [r.get("nombre") for r in batch["results"] if r.get("nombre")]
                 name_str = names[0] if names else "Desconocido"
                 final_message = f"⚠️ Timbre activado. Rostro reconocido: {name_str}. Se detectó un GUIÑO (posible emergencia)."
                 logging.info(f"Batch {batch_id} - Resultado final: GUIÑO - {final_message}")
                 send_whatsapp_message(final_message)
             elif any_recognized_no_wink:
-                # Tomar el primer nombre que apareció sin guiño
                 for r in batch["results"]:
                     if r.get("activar_rele") and r.get("nombre"):
                         final_message = f"✅ Timbre activado. Rostro reconocido: {r['nombre']}. Sin guiño."
@@ -192,17 +190,15 @@ def recibir():
                 logging.info(f"Batch {batch_id} - Resultado final: DENEGADO - {final_message}")
                 send_whatsapp_message(final_message)
 
-            # Limpiar lote para liberar memoria
+            # Limpiar lote
             del pending_batches[batch_id]
 
-        # Devolver respuesta individual (rápida) al ESP32
         return jsonify(individual_response), 200
 
     except Exception as e:
         logging.error(f"Error en /recibir: {e}")
         return jsonify({"error": str(e), "activar_rele": False}), 500
 
-# Carga inicial de rostros
 load_known_faces()
 
 if __name__ == "__main__":
