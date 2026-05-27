@@ -22,8 +22,13 @@ logging.basicConfig(level=logging.INFO)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
+# --- Almacenamiento temporal de lotes (para acumular resultados y enviar 1 solo WhatsApp) ---
+# Estructura: { batch_id: {"count": int, "results": list, "final_notified": bool} }
+pending_batches = {}
+
 known_face_histograms = {}
 
+# --- Funciones auxiliares (preprocesamiento, envío WhatsApp, etc.) ---
 def preprocess_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
@@ -89,108 +94,115 @@ def recognize_face_histogram(img, threshold=0.25):
     return None, 0, None
 
 def detect_wink_lightweight(img, face_rect):
-    """
-    Detección de guiño sin MediaPipe, usando solo OpenCV.
-    Tiempo estimado: 5-10ms.
-    """
     if face_rect is None:
         return False
-    
     x, y, w, h = face_rect
     face_roi = img[y:y+h, x:x+w]
     gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-    
-    # Dividir el rostro en mitades izquierda y derecha
     half = w // 2
     left_half = gray_face[:, :half]
     right_half = gray_face[:, half:]
-    
-    # Detectar ojos con Haar (rápido)
     eyes_left = eye_cascade.detectMultiScale(left_half, scaleFactor=1.05, minNeighbors=3, minSize=(10, 10))
     eyes_right = eye_cascade.detectMultiScale(right_half, scaleFactor=1.05, minNeighbors=3, minSize=(10, 10))
     total_eyes = len(eyes_left) + len(eyes_right)
-    
-    # Asimetría de brillo entre ambas mitades
     mean_left = np.mean(left_half)
     mean_right = np.mean(right_half)
     if max(mean_left, mean_right) == 0:
         asymmetry = 0
     else:
         asymmetry = abs(mean_left - mean_right) / max(mean_left, mean_right)
-    
-    # Condición: pocos ojos detectados o asimetría alta
     return (total_eyes < 2) or (asymmetry > 0.15)
 
-@app.route("/")
-def index():
-    return jsonify({
-        "status": "online",
-        "rostros_cargados": len(known_face_histograms)
-    })
-
+# --- Endpoint principal ---
 @app.route("/recibir", methods=["POST"])
 def recibir():
-    start_time = datetime.now()
     try:
         data = request.get_json()
-        if not data or 'foto' not in data:
-            return jsonify({"error": "No se recibió foto", "activar_rele": False}), 400
-        
+        if not data or 'foto' not in data or 'batch_id' not in data:
+            return jsonify({"error": "Faltan campos: foto y batch_id", "activar_rele": False}), 400
+
+        batch_id = data['batch_id']
         foto_b64 = data['foto']
         img_data = base64.b64decode(foto_b64)
         nparr = np.frombuffer(img_data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+
         if img is None:
             return jsonify({"error": "Error decodificando imagen", "activar_rele": False}), 400
-        
+
         img = preprocess_image(img)
         # (Opcional) img = cv2.resize(img, (320, 240))
-        
-        logging.info(f"Foto recibida ({len(img_data)} bytes)")
-        
+
+        logging.info(f"Batch {batch_id} - Foto recibida ({len(img_data)} bytes)")
+
+        # --- Reconocimiento de esta foto ---
         nombre, confianza, face_rect = recognize_face_histogram(img)
-        tiempo = (datetime.now() - start_time).total_seconds()
-        
+        tiene_guino = False
         if nombre:
             tiene_guino = detect_wink_lightweight(img, face_rect)
-            if tiene_guino:
-                mensaje = f"⚠️ Timbre activado. Rostro reconocido: {nombre}. Se detectó un GUIÑO (posible emergencia)."
-                logging.info(f"GUIÑO detectado - {tiempo:.2f}s")
-                send_whatsapp_message(mensaje)
-                return jsonify({
-                    "activar_rele": False,
-                    "motivo": "guiño",
-                    "nombre": nombre,
-                    "mensaje": "GUIÑO detectado. Acceso DENEGADO.",
-                    "tiempo": round(tiempo, 2)
-                }), 200
+
+        # --- Respuesta individual para el ESP32 (inmediata) ---
+        individual_response = {
+            "activar_rele": (nombre is not None and not tiene_guino),
+            "nombre": nombre,
+            "confianza": confianza,
+            "guino": tiene_guino
+        }
+
+        # --- Almacenar resultado para el lote ---
+        if batch_id not in pending_batches:
+            pending_batches[batch_id] = {
+                "count": 0,
+                "results": [],
+                "final_notified": False
+            }
+        batch = pending_batches[batch_id]
+        batch["count"] += 1
+        batch["results"].append(individual_response)
+
+        # --- Si ya llevamos 3 fotos, calcular resultado final y enviar WhatsApp (solo una vez) ---
+        if batch["count"] >= 3 and not batch["final_notified"]:
+            batch["final_notified"] = True
+            # Lógica final:
+            # - Si alguna foto tuvo guiño → bloqueado + emergencia
+            # - Si alguna foto tuvo reconocido sin guiño → permitido
+            # - Si no hay reconocido en ninguna → denegado
+            any_wink = any(r.get("guino", False) for r in batch["results"])
+            any_recognized_no_wink = any(r.get("activar_rele", False) for r in batch["results"])
+
+            if any_wink:
+                # Buscar nombre de la persona que hizo el guiño (si se reconoció)
+                names = [r.get("nombre") for r in batch["results"] if r.get("nombre")]
+                name_str = names[0] if names else "Desconocido"
+                final_message = f"⚠️ Timbre activado. Rostro reconocido: {name_str}. Se detectó un GUIÑO (posible emergencia)."
+                logging.info(f"Batch {batch_id} - Resultado final: GUIÑO - {final_message}")
+                send_whatsapp_message(final_message)
+            elif any_recognized_no_wink:
+                # Tomar el primer nombre que apareció sin guiño
+                for r in batch["results"]:
+                    if r.get("activar_rele") and r.get("nombre"):
+                        final_message = f"✅ Timbre activado. Rostro reconocido: {r['nombre']}. Sin guiño."
+                        break
+                else:
+                    final_message = "✅ Timbre activado. Rostro reconocido. Sin guiño."
+                logging.info(f"Batch {batch_id} - Resultado final: PERMITIDO - {final_message}")
+                send_whatsapp_message(final_message)
             else:
-                mensaje = f"✅ Timbre activado. Rostro reconocido: {nombre}. Sin guiño."
-                logging.info(f"Reconocido: {nombre} ({confianza}%) - {tiempo:.2f}s")
-                send_whatsapp_message(mensaje)
-                return jsonify({
-                    "activar_rele": True,
-                    "nombre": nombre,
-                    "confianza": confianza,
-                    "mensaje": f"Rostro reconocido: {nombre}. Acceso PERMITIDO.",
-                    "tiempo": round(tiempo, 2)
-                }), 200
-        else:
-            mensaje = "❗ Timbre activado. Rostro NO reconocido."
-            logging.info(f"No reconocido - {tiempo:.2f}s")
-            send_whatsapp_message(mensaje)
-            return jsonify({
-                "activar_rele": False,
-                "mensaje": "Rostro no reconocido. Acceso DENEGADO.",
-                "motivo": "no_reconocido",
-                "tiempo": round(tiempo, 2)
-            }), 200
-        
+                final_message = "❗ Timbre activado. Rostro NO reconocido."
+                logging.info(f"Batch {batch_id} - Resultado final: DENEGADO - {final_message}")
+                send_whatsapp_message(final_message)
+
+            # Limpiar lote para liberar memoria
+            del pending_batches[batch_id]
+
+        # Devolver respuesta individual (rápida) al ESP32
+        return jsonify(individual_response), 200
+
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"Error en /recibir: {e}")
         return jsonify({"error": str(e), "activar_rele": False}), 500
 
+# Carga inicial de rostros
 load_known_faces()
 
 if __name__ == "__main__":
