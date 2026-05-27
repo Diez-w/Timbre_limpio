@@ -59,7 +59,7 @@ def extract_face_histogram(img):
     return hist, (x, y, w, h)
 
 def load_known_faces():
-    """Carga rostros conocidos (fotos del POCO F5 Pro)"""
+    """Carga rostros conocidos (fotos)"""
     global known_face_histograms
     known_face_histograms = {}
     
