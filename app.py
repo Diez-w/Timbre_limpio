@@ -20,85 +20,192 @@ logging.basicConfig(level=logging.INFO)
 
 # --- Clasificadores OpenCV ---
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-# Ya no usaremos eye_cascade para detectar ojos cerrados, solo para referencia si se desea
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
+# --- Modelo LBPH global ---
+recognizer = cv2.face.LBPHFaceRecognizer_create(
+    radius=1,       # Radio del patrón LBP (1 es estándar)
+    neighbors=8,    # Puntos vecinos a comparar
+    grid_x=8,       # Grilla horizontal de celdas
+    grid_y=8        # Grilla vertical de celdas
+)
+label_map = {}       # {indice_int: "nombre_persona"}
+model_trained = False
 pending_batches = {}
-known_face_histograms = {}
+
+
+# ─────────────────────────────────────────────
+#  PREPROCESAMIENTO
+# ─────────────────────────────────────────────
 
 def preprocess_image(img):
-    """Mejora la calidad de la imagen usando CLAHE y filtro bilateral."""
+    """
+    Mejora la calidad de la imagen usando CLAHE y filtro bilateral.
+    Normaliza diferencias entre cámaras (ESP32-CAM vs cámaras de smartphone).
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     gray = cv2.bilateralFilter(gray, 5, 50, 50)
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-def send_whatsapp_message(message):
-    try:
-        encoded_message = urllib.parse.quote(message)
-        url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={encoded_message}&apikey={CALLMEBOT_API_KEY}"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            logging.info("WhatsApp enviado correctamente")
-        else:
-            logging.error(f"Error WhatsApp: {response.status_code}")
-    except Exception as e:
-        logging.error(f"Excepción WhatsApp: {e}")
 
-def extract_face_histogram(img):
+# ─────────────────────────────────────────────
+#  DETECCIÓN DE ROSTRO
+# ─────────────────────────────────────────────
+
+def detect_face(img):
+    """
+    Detecta el rostro principal en la imagen.
+    Retorna (face_roi_gray, face_rect) o (None, None) si no hay rostro.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(50, 50)
+    )
     if len(faces) == 0:
         return None, None
     x, y, w, h = faces[0]
-    face_roi = gray[y:y+h, x:x+w]
-    face_small = cv2.resize(face_roi, (32, 32))
-    hist = cv2.calcHist([face_small], [0], None, [32], [0, 256])
-    hist = cv2.normalize(hist, hist).flatten()
-    return hist, (x, y, w, h)
+    face_roi_gray = gray[y:y+h, x:x+w]
+    # Normalizar tamaño para que LBPH siempre trabaje con el mismo input
+    face_roi_gray = cv2.resize(face_roi_gray, (100, 100))
+    return face_roi_gray, (x, y, w, h)
+
+
+# ─────────────────────────────────────────────
+#  CARGA Y ENTRENAMIENTO CON LBPH
+# ─────────────────────────────────────────────
 
 def load_known_faces():
-    global known_face_histograms
-    known_face_histograms = {}
-    if not os.path.exists(BASE_ROSTROS_FOLDER):
-        return
-    for filename in os.listdir(BASE_ROSTROS_FOLDER):
-        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-            img_path = os.path.join(BASE_ROSTROS_FOLDER, filename)
-            img = cv2.imread(img_path)
-            if img is not None:
-                img_proc = preprocess_image(img)
-                hist, _ = extract_face_histogram(img_proc)
-                if hist is not None:
-                    nombre = filename.rsplit('.', 1)[0]
-                    known_face_histograms[nombre] = hist
-                    logging.info(f"Rostro registrado: {nombre}")
-    logging.info(f"Total rostros: {len(known_face_histograms)}")
-
-def recognize_face_histogram(img, threshold=0.35):  # Umbral más tolerante (0.35 en lugar de 0.30)
-    hist, face_rect = extract_face_histogram(img)
-    if hist is None or len(known_face_histograms) == 0:
-        return None, 0, None
-    best_name = None
-    best_score = float('inf')
-    for name, known_hist in known_face_histograms.items():
-        score = cv2.compareHist(hist, known_hist, cv2.HISTCMP_BHATTACHARYYA)
-        if score < best_score:
-            best_score = score
-            best_name = name
-    if best_score < threshold:
-        confidence = max(0, min(100, (1 - best_score / threshold) * 100))
-        return best_name, round(float(confidence), 2), face_rect
-    return None, 0, None
-
-def detect_wink_lightweight(img, face_rect):
     """
-    Detecta guiño usando exclusivamente asimetría de brillo y diferencia de varianza.
-    No depende de la detección de ojos (falla con ojos cerrados).
+    Lee todas las fotos de base_rostros/, detecta el rostro en cada una
+    y entrena el modelo LBPH.
+
+    Convención de nombres de archivo:
+        nombre_1.jpg, nombre_2.jpg, nombre_3.jpg ...
+    El texto antes del primer '_' (o antes del '.') se usa como nombre.
+    Ejemplo: juan_1.jpg → "juan" | maria.jpg → "maria"
+    """
+    global label_map, model_trained
+
+    faces_list = []
+    labels_list = []
+    name_to_label = {}   # {"juan": 0, "maria": 1, ...}
+    label_map = {}       # {0: "juan", 1: "maria", ...}
+    current_label = 0
+
+    if not os.path.exists(BASE_ROSTROS_FOLDER):
+        logging.warning("Carpeta base_rostros/ no encontrada.")
+        return
+
+    archivos = [
+        f for f in os.listdir(BASE_ROSTROS_FOLDER)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ]
+
+    if not archivos:
+        logging.warning("No hay fotos en base_rostros/.")
+        return
+
+    for filename in archivos:
+        img_path = os.path.join(BASE_ROSTROS_FOLDER, filename)
+        img = cv2.imread(img_path)
+        if img is None:
+            logging.warning(f"No se pudo leer: {filename}")
+            continue
+
+        img_proc = preprocess_image(img)
+        face_roi, _ = detect_face(img_proc)
+
+        if face_roi is None:
+            logging.warning(f"No se detectó rostro en: {filename}")
+            continue
+
+        # Extraer nombre: "juan_2.jpg" → "juan"
+        base_name = filename.rsplit('.', 1)[0]          # "juan_2"
+        nombre = base_name.split('_')[0]                # "juan"
+
+        if nombre not in name_to_label:
+            name_to_label[nombre] = current_label
+            label_map[current_label] = nombre
+            current_label += 1
+
+        faces_list.append(face_roi)
+        labels_list.append(name_to_label[nombre])
+        logging.info(f"Foto cargada: {filename} → persona '{nombre}'")
+
+    if len(faces_list) == 0:
+        logging.error("Ninguna foto válida para entrenar. Revisar base_rostros/.")
+        model_trained = False
+        return
+
+    recognizer.train(faces_list, np.array(labels_list))
+    model_trained = True
+    logging.info(
+        f"Modelo LBPH entrenado con {len(faces_list)} fotos "
+        f"de {len(label_map)} personas: {list(label_map.values())}"
+    )
+
+
+# ─────────────────────────────────────────────
+#  RECONOCIMIENTO FACIAL (LBPH)
+# ─────────────────────────────────────────────
+
+def recognize_face(img, confidence_threshold=60):
+    """
+    Reconoce el rostro en la imagen usando LBPH.
+
+    En LBPH, la confianza es una DISTANCIA: menor valor = mejor coincidencia.
+    - < 40  → reconocimiento muy seguro
+    - 40–60 → aceptable
+    - > 60  → demasiado diferente, se considera desconocido
+
+    Retorna (nombre, confianza_porcentaje, face_rect)
+    donde confianza_porcentaje es 0–100 (mayor = mejor).
+    """
+    if not model_trained:
+        logging.warning("Modelo LBPH no entrenado aún.")
+        return None, 0, None
+
+    img_proc = preprocess_image(img)
+    face_roi, face_rect = detect_face(img_proc)
+
+    if face_roi is None:
+        return None, 0, None
+
+    label, distance = recognizer.predict(face_roi)
+
+    if distance > confidence_threshold:
+        # Distancia alta = no reconocido
+        return None, 0, face_rect
+
+    nombre = label_map.get(label, "Desconocido")
+    # Convertir distancia a porcentaje legible (inverso normalizado)
+    confianza_pct = max(0, round((1 - distance / confidence_threshold) * 100, 2))
+
+    logging.info(f"Reconocido: {nombre} | Distancia LBPH: {distance:.2f} | Confianza: {confianza_pct}%")
+    return nombre, confianza_pct, face_rect
+
+
+# ─────────────────────────────────────────────
+#  DETECCIÓN DE GUIÑO (MEJORADA)
+# ─────────────────────────────────────────────
+
+def detect_wink(img, face_rect):
+    """
+    Detecta guiño analizando SOLO la franja de ojos del rostro.
+    Usa asimetría de brillo + diferencia de varianza (textura).
+
+    Mejora clave vs versión anterior:
+    - Recorta únicamente la banda ocular (20%–50% vertical del rostro)
+    - Elimina ruido de mejillas, frente e iluminación lateral
+    - Umbrales más precisos porque la señal es más limpia
     """
     if face_rect is None:
         return False
+
     x, y, w, h = face_rect
     if w <= 0 or h <= 0:
         return False
@@ -108,128 +215,198 @@ def detect_wink_lightweight(img, face_rect):
         return False
 
     gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-    # CLAHE para mejorar contraste
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    # CLAHE para normalizar contraste dentro del rostro
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
     gray_face = clahe.apply(gray_face)
 
-    # Dividir el rostro en dos mitades (izquierda y derecha)
-    half = w // 2
-    left_half = gray_face[:, :half]
-    right_half = gray_face[:, half:]
+    # ── Recorte de la banda ocular ──────────────────────────────────────
+    # Entre el 20% y el 50% vertical del rostro es donde están los ojos.
+    # Ignorar frente (0–20%) y parte inferior (50–100%) elimina el ruido
+    # de iluminación que causaba falsos positivos/negativos en la versión anterior.
+    eye_top    = int(h * 0.20)
+    eye_bottom = int(h * 0.50)
+    eye_band   = gray_face[eye_top:eye_bottom, :]
 
-    # 1. Diferencia de brillo medio (asimetría)
-    mean_left = np.mean(left_half)
-    mean_right = np.mean(right_half)
-    if max(mean_left, mean_right) == 0:
-        asymmetry = 0.0
-    else:
-        asymmetry = abs(mean_left - mean_right) / max(mean_left, mean_right)
+    if eye_band.size == 0:
+        return False
 
-    # 2. Diferencia de varianza (un ojo cerrado reduce la textura en ese lado)
-    var_left = np.var(left_half)
-    var_right = np.var(right_half)
-    if max(var_left, var_right) == 0:
-        var_ratio = 0.0
-    else:
-        var_ratio = abs(var_left - var_right) / max(var_left, var_right)
+    half = eye_band.shape[1] // 2
+    left_eye  = eye_band[:, :half]
+    right_eye = eye_band[:, half:]
 
-    # 3. Diferencia en el valor máximo (pico de brillo)
-    max_left = np.max(left_half)
-    max_right = np.max(right_half)
-    max_diff = abs(max_left - max_right) / max(max_left, max_right) if max(max_left, max_right) > 0 else 0
+    # ── Métrica 1: Asimetría de brillo medio ───────────────────────────
+    mean_l = np.mean(left_eye)
+    mean_r = np.mean(right_eye)
+    denom_mean = max(mean_l, mean_r, 1e-5)
+    asymmetry = abs(mean_l - mean_r) / denom_mean
 
-    # Umbrales ajustados para máxima sensibilidad (valores bajos)
-    ASYMMETRY_THRESHOLD = 0.08      # Muy sensible
-    VAR_RATIO_THRESHOLD = 0.15      # Diferencia de textura
-    MAX_DIFF_THRESHOLD = 0.10       # Diferencia de picos
+    # ── Métrica 2: Diferencia de varianza (textura) ─────────────────────
+    # Un ojo cerrado tiene menos textura (varianza más baja) que uno abierto.
+    var_l = np.var(left_eye)
+    var_r = np.var(right_eye)
+    denom_var = max(var_l, var_r, 1e-5)
+    var_ratio = abs(var_l - var_r) / denom_var
 
-    # Condiciones combinadas
-    wink_condition = (
-        (asymmetry > ASYMMETRY_THRESHOLD and var_ratio > VAR_RATIO_THRESHOLD) or
-        (asymmetry > ASYMMETRY_THRESHOLD and max_diff > MAX_DIFF_THRESHOLD) or
-        (var_ratio > 0.25)  # Si la varianza es muy diferente, casi seguro guiño
+    # ── Métrica 3: Diferencia de pico de brillo ─────────────────────────
+    max_l = float(np.max(left_eye))
+    max_r = float(np.max(right_eye))
+    denom_max = max(max_l, max_r, 1e-5)
+    max_diff = abs(max_l - max_r) / denom_max
+
+    # ── Umbrales calibrados para la banda ocular ────────────────────────
+    ASYM_THR    = 0.07   # Asimetría de brillo (más preciso que antes por el recorte)
+    VAR_THR     = 0.20   # Diferencia de textura
+    MAX_THR     = 0.10   # Diferencia de pico
+
+    wink = (
+        (asymmetry > ASYM_THR and var_ratio > VAR_THR) or
+        (asymmetry > ASYM_THR and max_diff > MAX_THR)  or
+        (var_ratio > 0.30)   # Varianza muy distinta = casi seguro guiño
     )
-    
-    # Log para depuración (opcional)
-    # logging.debug(f"Asym={asymmetry:.3f}, VarRatio={var_ratio:.3f}, MaxDiff={max_diff:.3f} -> Wink={wink_condition}")
-    
-    return wink_condition
+
+    logging.info(
+        f"Guiño → Asym={asymmetry:.3f} VarRatio={var_ratio:.3f} "
+        f"MaxDiff={max_diff:.3f} → {wink}"
+    )
+    return wink
+
+
+# ─────────────────────────────────────────────
+#  WHATSAPP
+# ─────────────────────────────────────────────
+
+def send_whatsapp_message(message):
+    try:
+        encoded = urllib.parse.quote(message)
+        url = (
+            f"https://api.callmebot.com/whatsapp.php"
+            f"?phone={WHATSAPP_PHONE}&text={encoded}&apikey={CALLMEBOT_API_KEY}"
+        )
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            logging.info("WhatsApp enviado correctamente.")
+        else:
+            logging.error(f"Error WhatsApp HTTP {response.status_code}")
+    except Exception as e:
+        logging.error(f"Excepción WhatsApp: {e}")
+
+
+# ─────────────────────────────────────────────
+#  RUTAS FLASK
+# ─────────────────────────────────────────────
 
 @app.route("/")
 def index():
     return jsonify({
         "status": "online",
-        "rostros_cargados": len(known_face_histograms)
+        "modelo": "LBPH",
+        "personas_registradas": len(label_map),
+        "nombres": list(label_map.values()),
+        "modelo_entrenado": model_trained
     })
+
+
+@app.route("/recargar_rostros", methods=["POST"])
+def recargar_rostros():
+    """
+    Endpoint opcional: recarga el modelo LBPH sin reiniciar el servidor.
+    Útil cuando se agregan nuevas fotos a base_rostros/ en caliente.
+    """
+    try:
+        load_known_faces()
+        return jsonify({
+            "ok": True,
+            "personas": list(label_map.values()),
+            "modelo_entrenado": model_trained
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/recibir", methods=["POST"])
 def recibir():
     try:
         data = request.get_json()
         if not data or 'foto' not in data or 'batch_id' not in data:
-            return jsonify({"error": "Faltan campos: foto y batch_id", "activar_rele": False}), 400
+            return jsonify({
+                "error": "Faltan campos: foto y batch_id",
+                "activar_rele": False
+            }), 400
 
-        batch_id = data['batch_id']
-        foto_b64 = data['foto']
+        batch_id  = data['batch_id']
+        foto_b64  = data['foto']
+
+        # Decodificar imagen
         img_data = base64.b64decode(foto_b64)
-        nparr = np.frombuffer(img_data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        nparr    = np.frombuffer(img_data, np.uint8)
+        img      = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return jsonify({"error": "Error decodificando imagen", "activar_rele": False}), 400
+            return jsonify({
+                "error": "Error decodificando imagen",
+                "activar_rele": False
+            }), 400
 
-        img = preprocess_image(img)
-        # img = cv2.resize(img, (320, 240))  # opcional
+        logging.info(f"Batch {batch_id} — foto recibida ({len(img_data)} bytes)")
 
-        logging.info(f"Batch {batch_id} - Foto recibida ({len(img_data)} bytes)")
+        # Reconocimiento facial con LBPH
+        nombre, confianza, face_rect = recognize_face(img)
 
-        nombre, confianza, face_rect = recognize_face_histogram(img)
+        # Detección de guiño solo si el rostro fue reconocido
         tiene_guino = False
         if nombre:
-            tiene_guino = detect_wink_lightweight(img, face_rect)
+            tiene_guino = detect_wink(img, face_rect)
 
         individual_response = {
             "activar_rele": bool(nombre is not None and not tiene_guino),
-            "nombre": nombre if nombre else None,
-            "confianza": float(confianza) if nombre else 0,
-            "guino": bool(tiene_guino)
+            "nombre":       nombre if nombre else None,
+            "confianza":    float(confianza),
+            "guino":        bool(tiene_guino)
         }
 
+        # ── Acumulación del batch ────────────────────────────────────────
         if batch_id not in pending_batches:
             pending_batches[batch_id] = {
                 "count": 0,
                 "results": [],
                 "final_notified": False
             }
+
         batch = pending_batches[batch_id]
-        batch["count"] += 1
+        batch["count"]   += 1
         batch["results"].append(individual_response)
 
+        # Al recibir la 3ª foto → evaluar resultado global y notificar
         if batch["count"] >= 3 and not batch["final_notified"]:
             batch["final_notified"] = True
-            any_wink = any(r.get("guino", False) for r in batch["results"])
-            any_recognized_no_wink = any(r.get("activar_rele", False) for r in batch["results"])
+            results = batch["results"]
+
+            any_wink             = any(r.get("guino", False)       for r in results)
+            any_recognized_ok    = any(r.get("activar_rele", False) for r in results)
 
             if any_wink:
-                names = [r.get("nombre") for r in batch["results"] if r.get("nombre")]
+                names    = [r["nombre"] for r in results if r.get("nombre")]
                 name_str = names[0] if names else "Desconocido"
-                final_message = f"⚠️ Timbre activado. Rostro reconocido: {name_str}. Se detectó un GUIÑO (posible emergencia)."
-                logging.info(f"Batch {batch_id} - Resultado final: GUIÑO")
-                send_whatsapp_message(final_message)
-            elif any_recognized_no_wink:
-                for r in batch["results"]:
-                    if r.get("activar_rele") and r.get("nombre"):
-                        final_message = f"✅ Timbre activado. Rostro reconocido: {r['nombre']}. Sin guiño."
-                        break
-                else:
-                    final_message = "✅ Timbre activado. Rostro reconocido. Sin guiño."
-                logging.info(f"Batch {batch_id} - Resultado final: PERMITIDO")
-                send_whatsapp_message(final_message)
-            else:
-                final_message = "❗ Timbre activado. Rostro NO reconocido."
-                logging.info(f"Batch {batch_id} - Resultado final: DENEGADO")
-                send_whatsapp_message(final_message)
+                msg = (
+                    f"⚠️ Timbre activado. Rostro reconocido: {name_str}. "
+                    f"Se detectó un GUIÑO (posible emergencia)."
+                )
+                logging.info(f"Batch {batch_id} — resultado final: GUIÑO DETECTADO")
 
+            elif any_recognized_ok:
+                name_str = next(
+                    (r["nombre"] for r in results if r.get("activar_rele") and r.get("nombre")),
+                    "Reconocido"
+                )
+                msg = f"✅ Timbre activado. Rostro reconocido: {name_str}. Sin guiño."
+                logging.info(f"Batch {batch_id} — resultado final: ACCESO PERMITIDO")
+
+            else:
+                msg = "❗ Timbre activado. Rostro NO reconocido."
+                logging.info(f"Batch {batch_id} — resultado final: ACCESO DENEGADO")
+
+            send_whatsapp_message(msg)
             del pending_batches[batch_id]
 
         return jsonify(individual_response), 200
@@ -237,6 +414,11 @@ def recibir():
     except Exception as e:
         logging.error(f"Error en /recibir: {e}")
         return jsonify({"error": str(e), "activar_rele": False}), 500
+
+
+# ─────────────────────────────────────────────
+#  ARRANQUE
+# ─────────────────────────────────────────────
 
 load_known_faces()
 
