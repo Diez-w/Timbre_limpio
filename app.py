@@ -43,9 +43,9 @@ mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=True,    # True para imágenes individuales (no video)
     max_num_faces=1,           # Solo el rostro más prominente
-    refine_landmarks=False,    # Sin landmarks extra de iris (ahorra RAM)
-    min_detection_confidence=0.4,  # Tolerante para imágenes del ESP32
-    min_tracking_confidence=0.4
+    refine_landmarks=False,    # Sin landmarks extra de iris (ahorra RAM y CPU)
+    min_detection_confidence=0.3,
+    min_tracking_confidence=0.3
 )
 
 # ── Índices de los puntos del contorno de cada ojo en FaceMesh ──────────
@@ -287,6 +287,15 @@ def detect_wink(img, face_rect):
     # Convertir a RGB que es lo que espera MediaPipe
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+    # ── Reducir resolución antes de MediaPipe ───────────────────────────
+    # El ESP32 ya envía QVGA (320×240) pero si viene de smartphone puede
+    # ser más grande. MediaPipe procesa igual de bien con 320×240 y
+    # tarda mucho menos en CPU limitada.
+    h_proc, w_proc = img_rgb.shape[:2]
+    if w_proc > 320 or h_proc > 240:
+        img_rgb = cv2.resize(img_rgb, (320, 240))
+        h_proc, w_proc = 240, 320
+
     results = face_mesh.process(img_rgb)
 
     if not results.multi_face_landmarks:
@@ -296,8 +305,8 @@ def detect_wink(img, face_rect):
 
     landmarks = results.multi_face_landmarks[0].landmark
 
-    ear_left  = eye_aspect_ratio(landmarks, LEFT_EYE,  w_img, h_img)
-    ear_right = eye_aspect_ratio(landmarks, RIGHT_EYE, w_img, h_img)
+    ear_left  = eye_aspect_ratio(landmarks, LEFT_EYE,  w_proc, h_proc)
+    ear_right = eye_aspect_ratio(landmarks, RIGHT_EYE, w_proc, h_proc)
 
     # Margen de separación: para considerar guiño, el ojo abierto debe
     # tener EAR claramente mayor que el umbral (no justo en el límite)
