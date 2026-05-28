@@ -57,17 +57,45 @@ def detect_face(img):
     """
     Detecta el rostro principal en la imagen.
     Retorna (face_roi_gray, face_rect) o (None, None) si no hay rostro.
+
+    Parámetros relajados para imágenes del ESP32-CAM (ruidosas, baja resolución):
+    - scaleFactor=1.05 → busca rostros en más escalas (más lento pero más sensible)
+    - minNeighbors=3   → menos estricto que 5, acepta detecciones con menos confirmaciones
+    - minSize=(30,30)  → acepta rostros más pequeños en el frame (antes era 50×50)
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Intento 1: parámetros relajados para ESP32-CAM
     faces = face_cascade.detectMultiScale(
         gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(50, 50)
+        scaleFactor=1.05,
+        minNeighbors=3,
+        minSize=(30, 30)
     )
+
+    # Intento 2: aún más permisivo si el primero no encuentra nada
     if len(faces) == 0:
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.05,
+            minNeighbors=1,
+            minSize=(20, 20)
+        )
+        if len(faces) > 0:
+            logging.info("Rostro detectado con parámetros mínimos (imagen de baja calidad)")
+
+    if len(faces) == 0:
+        logging.warning(
+            f"No se detectó rostro. Tamaño imagen: {img.shape[1]}×{img.shape[0]} | "
+            f"Brillo medio: {np.mean(gray):.1f}"
+        )
         return None, None
+
+    # Tomar el rostro más grande detectado (más confiable)
+    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
     x, y, w, h = faces[0]
+    logging.info(f"Rostro detectado: x={x} y={y} w={w} h={h}")
+
     face_roi_gray = gray[y:y+h, x:x+w]
     # Normalizar tamaño para que LBPH siempre trabaje con el mismo input
     face_roi_gray = cv2.resize(face_roi_gray, (100, 100))
@@ -153,17 +181,18 @@ def load_known_faces():
 #  RECONOCIMIENTO FACIAL (LBPH)
 # ─────────────────────────────────────────────
 
-def recognize_face(img, confidence_threshold=60):
+def recognize_face(img, confidence_threshold=100):
     """
     Reconoce el rostro en la imagen usando LBPH.
 
     En LBPH, la confianza es una DISTANCIA: menor valor = mejor coincidencia.
-    - < 40  → reconocimiento muy seguro
-    - 40–60 → aceptable
-    - > 60  → demasiado diferente, se considera desconocido
+    - < 50   → reconocimiento muy seguro
+    - 50–80  → aceptable
+    - 80–100 → tolerable (imágenes de baja calidad como ESP32-CAM)
+    - > 100  → demasiado diferente, se considera desconocido
 
-    Retorna (nombre, confianza_porcentaje, face_rect)
-    donde confianza_porcentaje es 0–100 (mayor = mejor).
+    Umbral en 100 para tolerar la baja calidad del ESP32-CAM.
+    Si hay muchos falsos positivos, bajar a 80.
     """
     if not model_trained:
         logging.warning("Modelo LBPH no entrenado aún.")
@@ -177,8 +206,17 @@ def recognize_face(img, confidence_threshold=60):
 
     label, distance = recognizer.predict(face_roi)
 
+    # Log siempre visible para calibrar el umbral
+    logging.info(
+        f"LBPH predict → label={label} ({label_map.get(label,'?')}) "
+        f"distancia={distance:.2f} umbral={confidence_threshold}"
+    )
+
     if distance > confidence_threshold:
         # Distancia alta = no reconocido
+        logging.warning(
+            f"Rostro detectado pero distancia {distance:.2f} > umbral {confidence_threshold} → NO reconocido"
+        )
         return None, 0, face_rect
 
     nombre = label_map.get(label, "Desconocido")
