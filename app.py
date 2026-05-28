@@ -181,18 +181,18 @@ def load_known_faces():
 #  RECONOCIMIENTO FACIAL (LBPH)
 # ─────────────────────────────────────────────
 
-def recognize_face(img, confidence_threshold=100):
+def recognize_face(img, confidence_threshold=150):
     """
     Reconoce el rostro en la imagen usando LBPH.
 
     En LBPH, la confianza es una DISTANCIA: menor valor = mejor coincidencia.
-    - < 50   → reconocimiento muy seguro
-    - 50–80  → aceptable
-    - 80–100 → tolerable (imágenes de baja calidad como ESP32-CAM)
-    - > 100  → demasiado diferente, se considera desconocido
+    - < 80   → reconocimiento muy seguro (misma cámara)
+    - 80–120 → aceptable
+    - 120–150→ tolerable (diferencia de cámara ESP32 vs smartphone)
+    - > 150  → demasiado diferente, se considera desconocido
 
-    Umbral en 100 para tolerar la baja calidad del ESP32-CAM.
-    Si hay muchos falsos positivos, bajar a 80.
+    Umbral en 150 para tolerar la diferencia entre ESP32-CAM y fotos de referencia
+    tomadas con smartphone. Bajar a 120 si aparecen falsos positivos.
     """
     if not model_trained:
         logging.warning("Modelo LBPH no entrenado aún.")
