@@ -6,7 +6,6 @@ import base64
 import logging
 import requests
 import urllib.parse
-import mediapipe as mp
 
 # --- Configuración WhatsApp ---
 WHATSAPP_PHONE = "+51902697385"
@@ -19,48 +18,20 @@ os.makedirs(BASE_ROSTROS_FOLDER, exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 
 # --- Clasificadores OpenCV ---
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
+eye_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_eye.xml'
+)
 
 # --- Modelo LBPH global ---
 recognizer = cv2.face.LBPHFaceRecognizer_create(
-    radius=1,
-    neighbors=8,
-    grid_x=8,
-    grid_y=8
+    radius=1, neighbors=8, grid_x=8, grid_y=8
 )
-label_map = {}
+label_map     = {}
 model_trained = False
 pending_batches = {}
-
-# ─────────────────────────────────────────────
-#  MEDIAPIPE — detector de landmarks faciales
-# ─────────────────────────────────────────────
-# FaceMesh detecta 468 puntos del rostro incluyendo contornos
-# detallados de ambos ojos (16 puntos por ojo).
-# Se inicializa una sola vez al arrancar para no pagar el costo
-# de inicialización en cada petición.
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=True,    # True para imágenes individuales (no video)
-    max_num_faces=1,           # Solo el rostro más prominente
-    refine_landmarks=False,    # Sin landmarks extra de iris (ahorra RAM y CPU)
-    min_detection_confidence=0.3,
-    min_tracking_confidence=0.3
-)
-
-# ── Índices de los puntos del contorno de cada ojo en FaceMesh ──────────
-# Estos son los 6 puntos estándar usados para calcular EAR (Eye Aspect Ratio)
-# extraídos del mapa de 468 landmarks de MediaPipe.
-# Ojo izquierdo (desde la perspectiva del observador = ojo derecho de la persona)
-LEFT_EYE  = [362, 385, 387, 263, 373, 380]
-# Ojo derecho (desde la perspectiva del observador = ojo izquierdo de la persona)
-RIGHT_EYE = [33,  160, 158, 133, 153, 144]
-
-# Umbral EAR: por debajo de este valor el ojo se considera cerrado.
-# Ojo abierto normal: EAR ≈ 0.25–0.35
-# Ojo medio cerrado:  EAR ≈ 0.18–0.25
-# Ojo cerrado (guiño):EAR < 0.18
-EAR_THRESHOLD = 0.20
 
 
 # ─────────────────────────────────────────────
@@ -68,10 +39,6 @@ EAR_THRESHOLD = 0.20
 # ─────────────────────────────────────────────
 
 def preprocess_image(img):
-    """
-    Mejora la calidad de la imagen usando CLAHE y filtro bilateral.
-    Normaliza diferencias entre cámaras (ESP32-CAM vs cámaras de smartphone).
-    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
@@ -80,54 +47,36 @@ def preprocess_image(img):
 
 
 # ─────────────────────────────────────────────
-#  DETECCIÓN DE ROSTRO (para LBPH)
+#  DETECCIÓN DE ROSTRO
 # ─────────────────────────────────────────────
 
 def detect_face(img):
-    """
-    Detecta el rostro principal usando Haar Cascade.
-    Retorna (face_roi_gray, face_rect) o (None, None).
-    Parámetros relajados para imágenes del ESP32-CAM.
-    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.05,
-        minNeighbors=3,
-        minSize=(30, 30)
+        gray, scaleFactor=1.05, minNeighbors=3, minSize=(30, 30)
     )
-
     if len(faces) == 0:
         logging.warning(
             f"No se detectó rostro. Tamaño: {img.shape[1]}×{img.shape[0]} | "
             f"Brillo medio: {np.mean(gray):.1f}"
         )
         return None, None
-
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
     x, y, w, h = faces[0]
     logging.info(f"Rostro detectado: x={x} y={y} w={w} h={h}")
-
     face_roi_gray = gray[y:y+h, x:x+w]
     face_roi_gray = cv2.resize(face_roi_gray, (100, 100))
     return face_roi_gray, (x, y, w, h)
 
 
 # ─────────────────────────────────────────────
-#  CARGA Y ENTRENAMIENTO CON LBPH
+#  CARGA Y ENTRENAMIENTO LBPH
 # ─────────────────────────────────────────────
 
 def load_known_faces():
-    """
-    Lee todas las fotos de base_rostros/ y entrena el modelo LBPH.
-    Convención: nombre_1.jpg, nombre_2.jpg → persona 'nombre'
-    """
     global label_map, model_trained
-
-    faces_list    = []
-    labels_list   = []
-    name_to_label = {}
-    label_map     = {}
+    faces_list, labels_list = [], []
+    name_to_label, label_map = {}, {}
     current_label = 0
 
     if not os.path.exists(BASE_ROSTROS_FOLDER):
@@ -138,38 +87,29 @@ def load_known_faces():
         f for f in os.listdir(BASE_ROSTROS_FOLDER)
         if f.lower().endswith(('.jpg', '.jpeg', '.png'))
     ]
-
     if not archivos:
         logging.warning("No hay fotos en base_rostros/.")
         return
 
     for filename in archivos:
-        img_path = os.path.join(BASE_ROSTROS_FOLDER, filename)
-        img = cv2.imread(img_path)
+        img = cv2.imread(os.path.join(BASE_ROSTROS_FOLDER, filename))
         if img is None:
-            logging.warning(f"No se pudo leer: {filename}")
             continue
-
         img_proc = preprocess_image(img)
         face_roi, _ = detect_face(img_proc)
-
         if face_roi is None:
-            logging.warning(f"No se detectó rostro en: {filename}")
+            logging.warning(f"Sin rostro en: {filename}")
             continue
-
-        base_name = filename.rsplit('.', 1)[0]
-        nombre    = base_name.split('_')[0]
-
+        nombre = filename.rsplit('.', 1)[0].split('_')[0]
         if nombre not in name_to_label:
             name_to_label[nombre] = current_label
             label_map[current_label] = nombre
             current_label += 1
-
         faces_list.append(face_roi)
         labels_list.append(name_to_label[nombre])
         logging.info(f"Foto cargada: {filename} → persona '{nombre}'")
 
-    if len(faces_list) == 0:
+    if not faces_list:
         logging.error("Ninguna foto válida para entrenar.")
         model_trained = False
         return
@@ -183,38 +123,24 @@ def load_known_faces():
 
 
 # ─────────────────────────────────────────────
-#  RECONOCIMIENTO FACIAL (LBPH)
+#  RECONOCIMIENTO FACIAL
 # ─────────────────────────────────────────────
 
 def recognize_face(img, confidence_threshold=150):
-    """
-    Reconoce el rostro usando LBPH.
-    Distancia LBPH: menor = mejor coincidencia.
-    Umbral 150 para tolerar diferencia ESP32-CAM vs smartphone.
-    """
     if not model_trained:
-        logging.warning("Modelo LBPH no entrenado.")
         return None, 0, None
-
     img_proc = preprocess_image(img)
     face_roi, face_rect = detect_face(img_proc)
-
     if face_roi is None:
         return None, 0, None
-
     label, distance = recognizer.predict(face_roi)
-
     logging.info(
         f"LBPH predict → label={label} ({label_map.get(label,'?')}) "
         f"distancia={distance:.2f} umbral={confidence_threshold}"
     )
-
     if distance > confidence_threshold:
-        logging.warning(
-            f"Distancia {distance:.2f} > umbral {confidence_threshold} → NO reconocido"
-        )
+        logging.warning(f"Distancia {distance:.2f} > umbral → NO reconocido")
         return None, 0, face_rect
-
     nombre = label_map.get(label, "Desconocido")
     confianza_pct = max(0, round((1 - distance / confidence_threshold) * 100, 2))
     logging.info(f"Reconocido: {nombre} | Distancia: {distance:.2f} | Confianza: {confianza_pct}%")
@@ -222,136 +148,64 @@ def recognize_face(img, confidence_threshold=150):
 
 
 # ─────────────────────────────────────────────
-#  CÁLCULO EAR (Eye Aspect Ratio)
-# ─────────────────────────────────────────────
-
-def eye_aspect_ratio(landmarks, eye_indices, img_w, img_h):
-    """
-    Calcula el EAR (Eye Aspect Ratio) para un ojo dado.
-
-    EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
-
-    Donde p1-p6 son los 6 puntos del contorno del ojo en orden:
-    p1=esquina izquierda, p2=superior izquierdo, p3=superior derecho,
-    p4=esquina derecha,   p5=inferior derecho,   p6=inferior izquierdo.
-
-    Un ojo abierto tiene EAR ≈ 0.25–0.35.
-    Un ojo cerrado (guiño) tiene EAR < 0.20.
-    """
-    def point(idx):
-        lm = landmarks[idx]
-        return np.array([lm.x * img_w, lm.y * img_h])
-
-    p1 = point(eye_indices[0])
-    p2 = point(eye_indices[1])
-    p3 = point(eye_indices[2])
-    p4 = point(eye_indices[3])
-    p5 = point(eye_indices[4])
-    p6 = point(eye_indices[5])
-
-    vertical_1 = np.linalg.norm(p2 - p6)
-    vertical_2 = np.linalg.norm(p3 - p5)
-    horizontal = np.linalg.norm(p1 - p4)
-
-    if horizontal < 1e-5:
-        return 0.30  # valor neutro si el denominador es 0
-
-    ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-    return ear
-
-
-# ─────────────────────────────────────────────
-#  DETECCIÓN DE GUIÑO (MediaPipe EAR)
+#  DETECCIÓN DE GUIÑO — MÉTODO COMBINADO
+#
+#  Estrategia de dos capas:
+#
+#  CAPA 1 — Haar Cascade de ojos (primario)
+#  Detecta cuántos ojos hay en la banda ocular.
+#  - 2 ojos detectados → ambos abiertos, sin guiño
+#  - 1 ojo detectado  → posible guiño, confirmar con capa 2
+#  - 0 ojos           → imagen oscura/borrosa, usar solo capa 2
+#
+#  CAPA 2 — Asimetría de brillo (confirmación)
+#  Si el cascade detectó 1 ojo, confirma con métricas de
+#  asimetría para reducir falsos positivos.
+#  Si el cascade detectó 0 ojos, usa umbrales más altos
+#  para evitar falsos positivos por imagen de mala calidad.
 # ─────────────────────────────────────────────
 
 def detect_wink(img, face_rect):
-    """
-    Detecta guiño usando MediaPipe FaceMesh + EAR.
-
-    Lógica:
-    - Se calculan EAR del ojo izquierdo y ojo derecho.
-    - Si UN solo ojo tiene EAR < EAR_THRESHOLD y el otro está abierto
-      (EAR > EAR_THRESHOLD + margen) → es guiño.
-    - Si AMBOS ojos tienen EAR bajo → es parpadeo normal, no guiño.
-
-    Ventaja sobre el método anterior de asimetría de brillo:
-    - Simétrico: detecta igual ojo izquierdo y derecho.
-    - No afectado por iluminación lateral.
-    - No genera falsos positivos por movimiento de cabeza.
-    """
-    if face_rect is None:
-        return False
-
-    h_img, w_img = img.shape[:2]
-
-    # Convertir a RGB que es lo que espera MediaPipe
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # ── Reducir resolución antes de MediaPipe ───────────────────────────
-    # El ESP32 ya envía QVGA (320×240) pero si viene de smartphone puede
-    # ser más grande. MediaPipe procesa igual de bien con 320×240 y
-    # tarda mucho menos en CPU limitada.
-    h_proc, w_proc = img_rgb.shape[:2]
-    if w_proc > 320 or h_proc > 240:
-        img_rgb = cv2.resize(img_rgb, (320, 240))
-        h_proc, w_proc = 240, 320
-
-    results = face_mesh.process(img_rgb)
-
-    if not results.multi_face_landmarks:
-        # MediaPipe no encontró landmarks — fallback al método de asimetría
-        logging.warning("MediaPipe no detectó landmarks, usando fallback de asimetría")
-        return detect_wink_fallback(img, face_rect)
-
-    landmarks = results.multi_face_landmarks[0].landmark
-
-    ear_left  = eye_aspect_ratio(landmarks, LEFT_EYE,  w_proc, h_proc)
-    ear_right = eye_aspect_ratio(landmarks, RIGHT_EYE, w_proc, h_proc)
-
-    # Margen de separación: para considerar guiño, el ojo abierto debe
-    # tener EAR claramente mayor que el umbral (no justo en el límite)
-    OPEN_MARGIN = 0.05
-
-    left_closed  = ear_left  < EAR_THRESHOLD
-    right_closed = ear_right < EAR_THRESHOLD
-    left_open    = ear_left  > (EAR_THRESHOLD + OPEN_MARGIN)
-    right_open   = ear_right > (EAR_THRESHOLD + OPEN_MARGIN)
-
-    # Guiño = exactamente un ojo cerrado y el otro claramente abierto
-    wink = (left_closed and right_open) or (right_closed and left_open)
-
-    logging.info(
-        f"EAR → izquierdo={ear_left:.3f} derecho={ear_right:.3f} "
-        f"umbral={EAR_THRESHOLD} → guiño={wink}"
-    )
-    return wink
-
-
-def detect_wink_fallback(img, face_rect):
-    """
-    Método de respaldo basado en asimetría de brillo.
-    Se usa solo cuando MediaPipe no detecta landmarks
-    (imagen muy oscura, rostro muy pequeño, etc).
-    """
     if face_rect is None:
         return False
 
     x, y, w, h = face_rect
-    face_roi = img[y:y+h, x:x+w]
-    if face_roi.size == 0:
+    if w <= 0 or h <= 0:
         return False
 
-    gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    gray_face = clahe.apply(gray_face)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    eye_band = gray_face[int(h * 0.20):int(h * 0.50), :]
-    if eye_band.size == 0:
+    # ── CAPA 1: Haar Cascade de ojos ────────────────────────────────────
+    # Recortar solo la franja de ojos (20%–50% vertical del rostro)
+    eye_top    = int(y + h * 0.20)
+    eye_bottom = int(y + h * 0.50)
+    eye_band_gray = gray[eye_top:eye_bottom, x:x+w]
+
+    if eye_band_gray.size == 0:
         return False
 
-    half      = eye_band.shape[1] // 2
-    left_eye  = eye_band[:, :half]
-    right_eye = eye_band[:, half:]
+    # CLAHE en la banda para mejorar contraste de ojos pequeños
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    eye_band_gray = clahe.apply(eye_band_gray)
+
+    eyes_detected = eye_cascade.detectMultiScale(
+        eye_band_gray,
+        scaleFactor=1.1,
+        minNeighbors=2,
+        minSize=(15, 15)
+    )
+    num_eyes = len(eyes_detected)
+    logging.info(f"Ojos detectados por cascade: {num_eyes}")
+
+    # 2 ojos → ambos abiertos, no hay guiño
+    if num_eyes >= 2:
+        logging.info("Guiño → False (2 ojos detectados)")
+        return False
+
+    # ── CAPA 2: Asimetría de brillo ──────────────────────────────────────
+    half      = eye_band_gray.shape[1] // 2
+    left_eye  = eye_band_gray[:, :half]
+    right_eye = eye_band_gray[:, half:]
 
     mean_l    = np.mean(left_eye)
     mean_r    = np.mean(right_eye)
@@ -365,17 +219,28 @@ def detect_wink_fallback(img, face_rect):
     max_r    = float(np.max(right_eye))
     max_diff = abs(max_l - max_r) / max(max_l, max_r, 1e-5)
 
-    wink = (
-        (asymmetry > 0.06 and var_ratio > 0.18 and max_diff > 0.09) or
-        (asymmetry > 0.08 and var_ratio > 0.28) or
-        (asymmetry > 0.08 and max_diff > 0.09) or
-        (var_ratio > 0.35)
+    logging.info(
+        f"Asimetría → Asym={asymmetry:.3f} VarRatio={var_ratio:.3f} "
+        f"MaxDiff={max_diff:.3f} | Ojos cascade={num_eyes}"
     )
 
-    logging.info(
-        f"Fallback → Asym={asymmetry:.3f} VarRatio={var_ratio:.3f} "
-        f"MaxDiff={max_diff:.3f} → {wink}"
-    )
+    if num_eyes == 1:
+        # Cascade detectó 1 ojo → probablemente hay guiño.
+        # Umbrales BAJOS porque el cascade ya da alta confianza.
+        wink = (
+            (asymmetry > 0.05 and var_ratio > 0.15) or
+            (asymmetry > 0.05 and max_diff > 0.08)  or
+            (var_ratio > 0.25)
+        )
+    else:
+        # Cascade detectó 0 ojos → imagen problemática.
+        # Umbrales ALTOS para evitar falsos positivos.
+        wink = (
+            (asymmetry > 0.08 and var_ratio > 0.28 and max_diff > 0.09) or
+            (var_ratio > 0.40)
+        )
+
+    logging.info(f"Guiño → {wink}")
     return wink
 
 
@@ -408,7 +273,7 @@ def index():
     return jsonify({
         "status": "online",
         "modelo_reconocimiento": "LBPH",
-        "modelo_guino": "MediaPipe FaceMesh EAR",
+        "modelo_guino": "Haar Cascade ojos + asimetría",
         "personas_registradas": len(label_map),
         "nombres": list(label_map.values()),
         "modelo_entrenado": model_trained
@@ -417,7 +282,6 @@ def index():
 
 @app.route("/recargar_rostros", methods=["POST"])
 def recargar_rostros():
-    """Recarga el modelo LBPH sin reiniciar el servidor."""
     try:
         load_known_faces()
         return jsonify({
@@ -447,10 +311,7 @@ def recibir():
         img      = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return jsonify({
-                "error": "Error decodificando imagen",
-                "activar_rele": False
-            }), 400
+            return jsonify({"error": "Error decodificando imagen", "activar_rele": False}), 400
 
         logging.info(f"Batch {batch_id} — foto recibida ({len(img_data)} bytes)")
 
@@ -469,9 +330,7 @@ def recibir():
 
         if batch_id not in pending_batches:
             pending_batches[batch_id] = {
-                "count": 0,
-                "results": [],
-                "final_notified": False
+                "count": 0, "results": [], "final_notified": False
             }
 
         batch = pending_batches[batch_id]
@@ -493,7 +352,6 @@ def recibir():
                     f"Se detectó un GUIÑO (posible emergencia)."
                 )
                 logging.info(f"Batch {batch_id} — resultado final: GUIÑO DETECTADO")
-
             elif any_recognized_ok:
                 name_str = next(
                     (r["nombre"] for r in results if r.get("activar_rele") and r.get("nombre")),
@@ -501,7 +359,6 @@ def recibir():
                 )
                 msg = f"✅ Timbre activado. Rostro reconocido: {name_str}. Sin guiño."
                 logging.info(f"Batch {batch_id} — resultado final: ACCESO PERMITIDO")
-
             else:
                 msg = "❗ Timbre activado. Rostro NO reconocido."
                 logging.info(f"Batch {batch_id} — resultado final: ACCESO DENEGADO")
