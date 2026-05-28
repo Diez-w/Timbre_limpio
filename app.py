@@ -73,17 +73,6 @@ def detect_face(img):
         minSize=(30, 30)
     )
 
-    # Intento 2: aún más permisivo si el primero no encuentra nada
-    if len(faces) == 0:
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.05,
-            minNeighbors=1,
-            minSize=(20, 20)
-        )
-        if len(faces) > 0:
-            logging.info("Rostro detectado con parámetros mínimos (imagen de baja calidad)")
-
     if len(faces) == 0:
         logging.warning(
             f"No se detectó rostro. Tamaño imagen: {img.shape[1]}×{img.shape[0]} | "
@@ -300,7 +289,7 @@ def detect_wink(img, face_rect):
     wink = (
         (asymmetry > ASYM_THR and var_ratio > VAR_THR) or
         (asymmetry > ASYM_THR and max_diff > MAX_THR)  or
-        (var_ratio > 0.30)   # Varianza muy distinta = casi seguro guiño
+        (var_ratio > 0.22)   # Varianza muy distinta = casi seguro guiño
     )
 
     logging.info(
