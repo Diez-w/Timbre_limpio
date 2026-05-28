@@ -282,15 +282,15 @@ def detect_wink(img, face_rect):
     max_diff = abs(max_l - max_r) / denom_max
 
     # ── Umbrales calibrados para la banda ocular ────────────────────────
-    ASYM_THR    = 0.06   # Bajado de 0.07 para capturar ojo izquierdo
-    VAR_THR     = 0.18   # Bajado de 0.20
-    MAX_THR     = 0.09   # Bajado de 0.10
+    ASYM_THR    = 0.06   # Asimetría de brillo
+    VAR_THR     = 0.18   # Diferencia de textura
+    MAX_THR     = 0.09   # Diferencia de pico
 
     wink = (
-        (asymmetry > ASYM_THR and var_ratio > VAR_THR) or
-        (asymmetry > ASYM_THR and max_diff > MAX_THR)  or
-        (var_ratio > 0.22) or                           # Varianza muy distinta
-        (asymmetry > 0.05 and max_diff > 0.09 and var_ratio > 0.05)  # Señal débil pero consistente en 3 métricas
+        (asymmetry > ASYM_THR and var_ratio > VAR_THR and max_diff > MAX_THR) or  # Las 3 métricas juntas
+        (asymmetry > 0.08 and var_ratio > 0.28) or   # Asimetría alta + mucha diferencia de textura
+        (asymmetry > 0.08 and max_diff > MAX_THR) or  # Asimetría alta + pico diferente
+        (var_ratio > 0.35)                             # Varianza extremadamente distinta = guiño claro
     )
 
     logging.info(
